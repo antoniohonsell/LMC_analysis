@@ -235,6 +235,7 @@ def tune_learning_rate_for_seed(
             epochs=epochs,
             lr=float(lr),
             batch_size=batch_size,
+            optimizer=optimizer,
             sgd_seed=sgd_seed,
             strict_init_params=strict_init_params,
         )
@@ -323,7 +324,6 @@ def train_two_disjoint_models_with_lr_tuning(
         device=device,
         strict_init_params=strict_init_params,
         criterion=criterion,
-        OPTIMIZER=optimizer,
     )
 
     return (model_a, best_a, res_a), (model_b, best_b, res_b)

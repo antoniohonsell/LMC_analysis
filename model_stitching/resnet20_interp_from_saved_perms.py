@@ -11,9 +11,9 @@ but without recomputing permutations/stitching.
 
 Typical usage (single run dir):
   PYTHONPATH="$(pwd)" python model_stitching/resnet20_interp_from_saved_perms.py \
-    --out-dir ./activation_stitching_out_cifar10_resnet20_8 \
+    --out-dir ./activation_stitching_out_cifar10_resnet20_32 \
     --data-root ./data \
-    --eval-samples 10000
+    --eval-samples 10000 \
     --num-lambdas 11
 
 If --out-dir does NOT directly contain permutations.json, the script will treat it as a parent
@@ -53,6 +53,11 @@ from model_stitching.activation_permutation_stitching import (
 )
 
 TensorDict = Dict[str, torch.Tensor]
+
+# plotting style
+import utils
+utils.apply_stitching_trend_style()
+palette = utils.get_deep_palette()
 
 
 @torch.no_grad()
@@ -185,11 +190,11 @@ def _build_eval_loaders(
     val_ds = Subset(eval_full, val_indices)
 
     loaders: Dict[str, DataLoader] = {
-        "subset_A_eval": DataLoader(subset_a_eval, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=(device.type == "cuda")),
-        "subset_B_eval": DataLoader(subset_b_eval, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=(device.type == "cuda")),
-        "val": DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=(device.type == "cuda")),
-        "test": DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=(device.type == "cuda")),
-        "train_eval": DataLoader(train_eval, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=(device.type == "cuda")),
+        #"subset_A_eval": DataLoader(subset_a_eval, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=(device.type == "cuda")),
+        #"subset_B_eval": DataLoader(subset_b_eval, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=(device.type == "cuda")),
+        #"val": DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=(device.type == "cuda")),
+        "test": DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=False),
+        "train_eval": DataLoader(train_eval, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=False),
     }
 
     def max_batches_for(ds_len: int) -> Optional[int]:
@@ -375,7 +380,7 @@ def main() -> None:
     p.add_argument("--data-root", type=str, default="./data")
     p.add_argument("--num-lambdas", type=int, default=25)
     p.add_argument("--batch-size", type=int, default=256)
-    p.add_argument("--num-workers", type=int, default=0)
+    p.add_argument("--num-workers", type=int, default=2)
     p.add_argument("--eval-samples", type=int, default=0, help="<=0 means full split.")
     p.add_argument("--overwrite", action="store_true")
     args = p.parse_args()

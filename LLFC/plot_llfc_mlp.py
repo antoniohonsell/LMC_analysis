@@ -12,6 +12,14 @@ except Exception:
     utils = None
 
 
+"""
+how to run:
+python LLFC/plot_llfc_mlp.py \
+    --results runs/llfc_mlp_MNIST/llfc_cos_fmnist_mlp.pt \
+    --heatmap
+"""
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--results", type=str, required=True, help="Path to llfc_cos_*.pt")

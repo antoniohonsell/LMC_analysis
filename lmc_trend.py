@@ -21,8 +21,21 @@ Example usage:
   python lmc_trend.py \
     --weight-root ./weight_matching_out \
     --activation-root . \
-    --out lmc_mean_std.png \
-    --split test
+    --out overall_plots/lmc_mean_std_CIFAR100.png \
+    --split test \
+    --weight-dataset CIFAR100 \
+    --weight-regime disjoint
+
+
+Fianl usage :
+python lmc_trend.py \
+  --weight-dataset CIFAR100 \
+  --weight-root ./weight_matching_out \
+  --activation-root . \
+  --activation-weight-dataset CIFAR100 \
+  --activation-weight-regime disjoint \
+  --split test \
+  --out overall_plots/lmc_mean_std_CIFAR100.png
 
 If you only have one method, just omit the other root.
 """
@@ -120,6 +133,77 @@ def _lambda_key(lam: float, ndp: int = 6) -> str:
     # stable bucket key across runs
     return f"{lam:.{ndp}f}"
 
+def _norm_dataset_name(x: str) -> str:
+    return str(x).strip().upper()
+
+
+def _norm_regime_name(x: str) -> str:
+    return str(x).strip().lower()
+
+
+def _resolve_activation_search_root(
+    root: Path,
+    *,
+    weight_dataset: str,
+    weight_regime: str,
+    verbose: bool,
+) -> Path:
+    """
+    Try to route the search into the folder structure you showed:
+
+        <repo_root>/activation_out/<DATASET>/.../results.json
+
+    Also supports:
+      - passing activation_out directly
+      - passing the dataset folder directly (e.g. activation_out/CIFAR100)
+      - (optional) regime subfolder if you ever add it
+    Falls back to the original root if nothing matches.
+    """
+    if root.is_file():
+        return root
+
+    ds_norm = _norm_dataset_name(weight_dataset)
+    reg_norm = _norm_regime_name(weight_regime)
+
+    ds_dir_names = {
+        str(weight_dataset).strip(),
+        str(weight_dataset).strip().upper(),
+        str(weight_dataset).strip().lower(),
+        str(weight_dataset).strip().capitalize(),
+    }
+    ds_dir_names = {s for s in ds_dir_names if s}
+
+    candidates: List[Path] = []
+
+    # If user passes repo root known to contain activation_out/<DATASET>/...
+    for d in ds_dir_names:
+        candidates.append(root / "activation_out" / d / reg_norm)
+        candidates.append(root / "activation_out" / d)
+
+    # If user passes activation_out directly
+    if root.name == "activation_out":
+        for d in ds_dir_names:
+            candidates.append(root / d / reg_norm)
+            candidates.append(root / d)
+
+    # If user passes dataset folder directly
+    if _norm_dataset_name(root.name) == ds_norm:
+        candidates.append(root / reg_norm)
+        candidates.append(root)
+
+    for c in candidates:
+        if c.exists():
+            if verbose:
+                print(f"[activation] resolved search root: {c}", file=sys.stderr)
+            return c
+
+    if verbose:
+        print(
+            f"[activation][WARN] could not resolve activation_out/<dataset> under {root}; using {root}",
+            file=sys.stderr,
+        )
+    return root
+
 
 def _iter_results_json_files(root: Path) -> List[Path]:
     if root.is_file():
@@ -127,22 +211,31 @@ def _iter_results_json_files(root: Path) -> List[Path]:
     return sorted(root.rglob("results.json"))
 
 
-def _iter_interp_pt_files(root: Path) -> List[Path]:
+def _iter_interp_pt_files(root: Path, *, dataset: str = "CIFAR10", regime: str = "disjoint") -> List[Path]:
     if root.is_file():
         return [root]
-    return sorted(root.rglob("interp_results.pt"))
+    pattern = f"resnet20_*/{dataset}/{regime}/interp_results.pt"
+    return sorted(root.glob(pattern))
 
 
 def _collect_activation(
     *,
     root: Path,
     split: str,
+    weight_dataset: str = "CIFAR10",
+    weight_regime: str = "disjoint",
     include_endpoints: bool,
     target_ws: List[int],
     acc: DefaultDict[Tuple[str, int, str], List[float]],
     verbose: bool,
 ) -> int:
-    files = _iter_results_json_files(root)
+    search_root = _resolve_activation_search_root(
+        root,
+        weight_dataset=weight_dataset,
+        weight_regime=weight_regime,
+        verbose=verbose,
+    )
+    files = _iter_results_json_files(search_root)
     n_used = 0
 
     for fp in files:
@@ -153,6 +246,14 @@ def _collect_activation(
                 print(f"[activation][WARN] failed to read {fp}: {e}", file=sys.stderr)
             continue
         if not isinstance(obj, dict):
+            continue
+        ds = obj.get("dataset", None)
+        rg = obj.get("regime", None)
+
+        # If these fields exist in results.json, enforce them.
+        if isinstance(ds, str) and _norm_dataset_name(ds) != _norm_dataset_name(weight_dataset):
+            continue
+        if isinstance(rg, str) and _norm_regime_name(rg) != _norm_regime_name(weight_regime):
             continue
 
         # Must have interpolation
@@ -192,13 +293,15 @@ def _collect_weight(
     target_ws: List[int],
     acc: DefaultDict[Tuple[str, int, str], List[float]],
     verbose: bool,
+    weight_dataset: str = "CIFAR10",
+    weight_regime: str = "disjoint",
 ) -> int:
     try:
         import torch
     except Exception as e:
         raise RuntimeError("Weight-method collection requires torch to load interp_results.pt") from e
 
-    files = _iter_interp_pt_files(root)
+    files = _iter_interp_pt_files(root, dataset=weight_dataset, regime=weight_regime)
     n_used = 0
 
     for fp in files:
@@ -389,6 +492,14 @@ def main() -> int:
                     help="Output plot path (default: lmc_mean_std.png).")
     ap.add_argument("--title", type=str, default=None, help="Optional plot title.")
     ap.add_argument("--verbose", action="store_true")
+    ap.add_argument("--weight-dataset", type=str, default="CIFAR10",
+                help="Dataset subdir for weight-matching results (default: CIFAR10).")
+    ap.add_argument("--weight-regime", type=str, default="disjoint",
+                help="Regime subdir for weight-matching results (default: disjoint).")
+    ap.add_argument("--activation-weight-dataset", type=str, default="CIFAR10",
+                    help="Dataset to select activation_out/<dataset>/... and filter results.json (default: CIFAR10).")
+    ap.add_argument("--activation-weight-regime", type=str, default="disjoint",
+                    help="Regime to filter activation results.json (default: disjoint).")
     args = ap.parse_args()
 
     target_ws = [int(s.strip()) for s in args.ws.split(",") if s.strip()]
@@ -400,17 +511,21 @@ def main() -> int:
 
     if args.weight_root:
         n_w = _collect_weight(
-            root=Path(args.weight_root).expanduser().resolve(),
-            include_endpoints=bool(args.include_endpoints),
-            target_ws=target_ws,
-            acc=acc,
-            verbose=bool(args.verbose),
-        )
+        root=Path(args.weight_root).expanduser().resolve(),
+        include_endpoints=bool(args.include_endpoints),
+        target_ws=target_ws,
+        acc=acc,
+        verbose=bool(args.verbose),
+        weight_dataset=str(args.weight_dataset),
+        weight_regime=str(args.weight_regime),
+    )
 
     if args.activation_root:
         n_a = _collect_activation(
             root=Path(args.activation_root).expanduser().resolve(),
             split=str(args.split),
+            weight_dataset=str(args.activation_weight_dataset),
+            weight_regime=str(args.activation_weight_regime),
             include_endpoints=bool(args.include_endpoints),
             target_ws=target_ws,
             acc=acc,

@@ -17,15 +17,19 @@ PYTHONPATH="$(pwd)"
 where pwd is the root  
 
 HOW TO RUN :
-python model_stitching/resnet20_activation_stitching.py \
-  --dataset CIFAR10 \
-  --runs-root ./runs_resnet20_32 \
-  --regime disjoint \
-  --base-seed 0 \
-  --which best \
-  --match-split train_eval \
-  --match-samples 10000 \
-  --do-interp
+export PYTHONPATH="$(pwd)" 
+for x in 16 ; do
+    python model_stitching/resnet20_activation_stitching.py \
+    --dataset CIFAR100 \
+    --runs-root ./runs_resnet20_${x} \
+    --regime disjoint \
+    --base-seed 0 \
+    --which best \
+    --match-split train_eval \
+    --match-samples 10000 \
+    --do-interp \
+    --out-dir ./activation_out/CIFAR100/activation_stitching_out_cifar100_resnet20_${x}
+  done
 """
 
 from __future__ import annotations
@@ -171,7 +175,7 @@ def _plot_stitching(
         ax.plot(cuts, d["loss_naive"], linestyle="dashed", alpha=0.5, linewidth=2, label=f"{split} naive")
         ax.plot(cuts, d["loss_perm"], linestyle="solid", linewidth=2, label=f"{split} perm")
     ax.set_xlabel("cut k (take first k sections from A)")
-    ax.set_ylabel("cross-entropy loss")
+    ax.set_ylabel("Loss")
     ax.set_title(title)
     ax.set_xticks(cuts)
     ax.legend(framealpha=0.6)
@@ -446,7 +450,7 @@ def main() -> None:
     loaders: Dict[str, DataLoader] = {
         "subset_A_eval": DataLoader(subset_a_eval, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=(device.type == "cuda")),
         "subset_B_eval": DataLoader(subset_b_eval, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=(device.type == "cuda")),
-        "val": DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=(device.type == "cuda")),
+        #"val": DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=(device.type == "cuda")),
         "test": DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=(device.type == "cuda")),
     }
 
@@ -563,10 +567,10 @@ def main() -> None:
             stitch_metrics[split]["loss_perm"].append(loss)
             stitch_metrics[split]["acc_perm"].append(acc)
 
-    title = (
-        f"{args.dataset} ResNet20-LN activation stitching, disjoint"
-        f"(width={width_multiplier}, shortcut={shortcut_option}) "
-        #f"A={ckpt_a.name} B={ckpt_b.name} match={args.match_split}"
+    title = (""
+        # f"{args.dataset} ResNet20-LN activation stitching, disjoint"
+        # f"(width={width_multiplier}, shortcut={shortcut_option}) "
+        # f"A={ckpt_a.name} B={ckpt_b.name} match={args.match_split}"
     )
     _plot_stitching(title=title, cuts=cuts, metrics=stitch_metrics, out_dir=out_dir)
 

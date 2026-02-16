@@ -35,15 +35,15 @@ python linear_mode_connectivity/cifar_resnet20_ln_weight_matching_interp.py --da
 ==== new command to:
 
 export PYTHONPATH="$(pwd)" 
-for x in 1 ; do 
+for x in 32 ; do 
     python linear_mode_connectivity/cifar_resnet20_ln_weight_matching_interp.py \
-    --dataset CIFAR100 \
-    --ckpt-a ./runs_resnet20_${x}/CIFAR100/disjoint/seed_0/subset_A/resnet20_CIFAR100_seed0_subsetA_best.pth \
-    --ckpt-b ./runs_resnet20_${x}/CIFAR100/disjoint/seed_0/subset_B/resnet20_CIFAR100_seed0_subsetB_best.pth \
+    --dataset CIFAR10 \
+    --ckpt-a ./runs_resnet20_${x}/CIFAR10/disjoint/seed_0/subset_A/resnet20_CIFAR10_seed0_subsetA_best.pth \
+    --ckpt-b ./runs_resnet20_${x}/CIFAR10/disjoint/seed_0/subset_B/resnet20_CIFAR10_seed0_subsetB_best.pth \
     --width-multiplier "$x" \
     --shortcut-option C \
     --norm flax_ln \
-    --out-dir ./weight_matching_out/resnet20_${x}/CIFAR100/disjoint
+    --out-dir ./weight_matching_out/resnet20_${x}/CIFAR10/disjoint
 done
 
 """
@@ -167,7 +167,7 @@ def plot_interp_loss(epoch_label, lambdas, train_loss_naive, test_loss_naive, tr
     ax.set_xticks([0, 1])
     ax.set_xticklabels(["Model A", "Model B"])
     ax.set_ylabel("Loss")
-    ax.set_title(f"Loss Barrier : width {width_multiplier}")
+    #ax.set_title(f"Loss Barrier : width {width_multiplier}")
     ax.legend(loc="upper right", framealpha=0.5)
     fig.tight_layout()
     return fig
