@@ -37,6 +37,7 @@ for w in 32; do
     --ckpt_a runs_resnet20_$w/CIFAR100/disjoint/seed_0/subset_A/resnet20_CIFAR100_seed0_subsetA_best.pth \
     --ckpt_b runs_resnet20_$w/CIFAR100/disjoint/seed_0/subset_B/resnet20_CIFAR100_seed0_subsetB_best.pth \
     --out runs/llfc_resnet20_ln_cifar100_w$w
+    --max_batches 10
 done
 
 Notes:
@@ -49,6 +50,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import pickle
 import re
 import sys
 from dataclasses import dataclass
@@ -84,6 +86,56 @@ except Exception:
 
 
 TensorDict = Dict[str, torch.Tensor]
+
+
+def load_wm_perm_pkl(path: str) -> Dict[str, torch.Tensor]:
+    """
+    Load a weight-matching permutation saved as a pickle:
+      {perm_name: np.ndarray | list | torch.Tensor}
+    Returns:
+      {perm_name: 1D LongTensor}
+    """
+    with open(path, "rb") as f:
+        obj = pickle.load(f)
+    if not isinstance(obj, dict):
+        raise ValueError(f"--wm_perm must be a pickled dict, got {type(obj)} at {path}")
+    perm: Dict[str, torch.Tensor] = {}
+    for k, v in obj.items():
+        t = torch.as_tensor(v, dtype=torch.long)
+        if t.ndim != 1:
+            raise ValueError(f"Permutation '{k}' must be 1D, got shape={tuple(t.shape)}")
+        perm[str(k)] = t.cpu()
+    return perm
+
+def mlp_axes_to_perm_from_state(state: TensorDict) -> Dict[str, Tuple[Optional[str], ...]]:
+    """
+    Same logic as linear_mode_connectivity/mlp_weight_matching_interp.py:
+    build axes_to_perm for an MLP with fc1..fcN. (Hidden layers permuted, classifier output not permuted.)
+    """
+    pat = re.compile(r"^fc(\d+)\.weight$")
+    layer_ids: List[int] = []
+    for k in state.keys():
+        m = pat.match(k)
+        if m:
+            layer_ids.append(int(m.group(1)))
+    layer_ids = sorted(set(layer_ids))
+    if not layer_ids:
+        raise KeyError("No fc{n}.weight keys found (needed to build MLP permutation spec).")
+    n_layers = max(layer_ids)
+    expected = list(range(1, n_layers + 1))
+    if layer_ids != expected:
+        raise ValueError(f"Expected contiguous fc layers {expected}, found {layer_ids}")
+
+    axes: Dict[str, Tuple[Optional[str], ...]] = {}
+    prev_p: Optional[str] = None
+    for i in range(1, n_layers):
+        p_out = f"P{i}"
+        axes[f"fc{i}.weight"] = (p_out, prev_p)  # (out, in)
+        axes[f"fc{i}.bias"]   = (p_out,)         # (out,)
+        prev_p = p_out
+    axes[f"fc{n_layers}.weight"] = (None, prev_p)
+    axes[f"fc{n_layers}.bias"]   = (None,)
+    return axes
 
 
 # ---------------------------
@@ -483,6 +535,10 @@ def main() -> None:
     p.add_argument("--data_root", type=str, default="./data")
     p.add_argument("--ckpt_a", type=str, required=True)
     p.add_argument("--ckpt_b", type=str, required=True)
+    p.add_argument("--wm_perm", type=str, default=None,
+                   help="Optional: path to weight-matching permutation_seed*.pkl. If set, B is permuted before LLFC.")
+    p.add_argument("--wm_perm_invert", action="store_true",
+                   help="Invert the permutation (useful if your saved mapping is B->A instead of A->B).")
     p.add_argument("--out", type=str, required=True)
 
     p.add_argument("--arch", type=str, required=True, help="e.g. mlp, resnet20, resnet18, lightnet, ...")
@@ -583,13 +639,54 @@ def main() -> None:
     sd_b = filter_to_model_keys(sd_b_raw, model_b)
 
     # Ensure both are aligned key-wise for interpolation
+    # Ensure both are aligned key-wise for interpolation (fail fast)
     if sd_a.keys() != sd_b.keys():
-        # Try to align by intersecting (last resort)
-        common = sorted(set(sd_a.keys()) & set(sd_b.keys()))
-        sd_a = {k: sd_a[k] for k in common}
-        sd_b = {k: sd_b[k] for k in common}
-        if not common:
-            raise KeyError("No common keys between ckpt_a and ckpt_b after filtering to model keys.")
+        missing_in_b = sorted(set(sd_a.keys()) - set(sd_b.keys()))
+        missing_in_a = sorted(set(sd_b.keys()) - set(sd_a.keys()))
+        raise KeyError(
+            "State dict keysets differ after filtering to model keys; cannot safely compare/interpolate.\n"
+            f"Missing in B: {missing_in_b[:20]}{' ...' if len(missing_in_b) > 20 else ''}\n"
+            f"Missing in A: {missing_in_a[:20]}{' ...' if len(missing_in_a) > 20 else ''}\n"
+        )
+    # -------------------------`
+    # OPTIONAL: permute B using a saved weight-matching permutation
+    # -------------------------
+    if args.wm_perm is not None:
+        try:
+            from linear_mode_connectivity.weight_matching_torch import (
+                apply_permutation,
+                permutation_spec_from_axes_to_perm,
+                resnet20_layernorm_permutation_spec,
+            )
+        except Exception as e:
+            raise ImportError(
+                "Failed to import linear_mode_connectivity.weight_matching_torch (needed for --wm_perm). "
+                "Make sure dependencies (notably SciPy) are installed."
+            ) from e
+
+        perm = load_wm_perm_pkl(args.wm_perm)
+        if args.wm_perm_invert:
+            perm = {k: torch.argsort(v) for k, v in perm.items()}
+
+        if arch.lower() == "resnet20":
+            ps = resnet20_layernorm_permutation_spec(
+                shortcut_option=str(shortcut_opt or "C"),
+                state_dict=sd_b,   # prune spec to exactly existing keys
+            )
+        elif arch.lower() in ("mlp", "lightnet"):
+            axes_to_perm = mlp_axes_to_perm_from_state(sd_a)
+            ps = permutation_spec_from_axes_to_perm(axes_to_perm)
+        else:
+            raise ValueError(f"--wm_perm currently supported only for arch in {{resnet20, mlp, lightnet}}; got {arch}")
+
+        needed = set(ps.perm_to_axes.keys())
+        missing = sorted(needed - set(perm.keys()))
+        if missing:
+            raise KeyError(f"--wm_perm is missing permutation keys required by spec: {missing}")
+        perm = {k: v for k, v in perm.items() if k in needed}
+
+        # Replace B with P(B)
+        sd_b = apply_permutation(ps, perm, sd_b)
 
     model_a.load_state_dict(sd_a, strict=True)
     model_b.load_state_dict(sd_b, strict=True)
@@ -638,6 +735,8 @@ def main() -> None:
         "in_channels": in_channels,
         "ckpt_a": args.ckpt_a,
         "ckpt_b": args.ckpt_b,
+        "wm_perm": args.wm_perm,
+        "wm_perm_invert": bool(args.wm_perm_invert),
         "include_head": bool(args.include_head),
         "flatten_input": bool(flatten_input),
         **results,
