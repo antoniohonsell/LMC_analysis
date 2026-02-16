@@ -28,6 +28,7 @@ for x in 1 2 8 16 ; do
     --act-perm activation_out/CIFAR100/activation_stitching_out_cifar100_resnet20_${x}/permutations.json \
     --wgt-perm weight_matching_out/resnet20_${x}/CIFAR100/disjoint/permutation_seed0.pkl \
     --unit-dim 1 \
+    --dataset CIFAR100 \
     --state-a runs_resnet20_${x}/CIFAR100/disjoint/seed_0/subset_A/resnet20_CIFAR100_seed0_subsetA_best.pth \
     --state-b runs_resnet20_${x}/CIFAR100/disjoint/seed_0/subset_B/resnet20_CIFAR100_seed0_subsetB_best.pth\
     --shortcut-option C \
@@ -567,7 +568,6 @@ def _get_submodule_by_name(model: nn.Module, name: str) -> nn.Module:
         else:
             cur = getattr(cur, part)
     return cur
-
 @torch.no_grad()
 def compute_features_from_state_dicts(
     *,
@@ -586,23 +586,52 @@ def compute_features_from_state_dicts(
     features_dtype: torch.dtype,
 ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
     """
-    Builds model A/B, loads weights, runs one forward pass over the chosen split,
+    Builds model A/B, loads weights, runs forward passes over the chosen split,
     and records activations for every perm-key in ps.perm_to_axes.
-    """
-    if dataset not in train_resnet.DATASET_STATS:
-        raise ValueError(f"Unsupported dataset: {dataset}")
 
-    # datasets: train_full has augmentation; eval_full + test have only normalization
-    train_full, eval_full, test_ds, _targets = train_resnet.load_cifar_datasets(dataset, data_root)  # :contentReference[oaicite:4]{index=4}
+    Supports:
+      - ResNet20 (CIFAR-style) via architectures.build_model("resnet20", ...)
+      - MLP (fc1..fc4) via architectures.MLP / architectures.build_model("mlp", ...)
+
+    For MLP, since ReLUs are functional (no nn.ReLU modules), we hook the Linear
+    layers (fc1/fc2/fc3) and apply ReLU inside the hook so features correspond
+    to the post-activation hidden units.
+    """
+    import math
+    import re
+    import datasets as ds_utils
+
+    # -------------------------
+    # Dataset / loader
+    # -------------------------
+    dataset_u = dataset.strip().upper()
+    if dataset_u not in ds_utils.DATASET_STATS:
+        raise ValueError(
+            f"Unsupported dataset: {dataset} (supported: {sorted(ds_utils.DATASET_STATS)})"
+        )
+
+    # train_full has optional augmentation; eval_full + test have no augmentation
+    _train_full, eval_full, test_ds = ds_utils.build_datasets(
+        dataset_u,
+        root=data_root,
+        download=True,
+        augment_train=False,
+        normalize=True,
+    )
 
     if split == "test":
         ds = test_ds
     elif split == "train_eval":
         ds = eval_full
     else:
-        raise ValueError(f"Unsupported split for features: {split} (use 'test' or 'train_eval')")
+        raise ValueError(
+            f"Unsupported split for features: {split} (use 'test' or 'train_eval')"
+        )
 
-    if samples is not None and samples > 0 and samples < len(ds):
+    if samples is not None and int(samples) <= 0:
+        samples = None
+
+    if samples is not None and samples < len(ds):
         ds = Subset(ds, list(range(int(samples))))
 
     loader = DataLoader(
@@ -613,43 +642,153 @@ def compute_features_from_state_dicts(
         pin_memory=(device.type == "cuda"),
     )
 
-    num_classes = int(train_resnet.DATASET_STATS[dataset]["num_classes"])  # :contentReference[oaicite:5]{index=5}
+    # -------------------------
+    # Architecture detection
+    # -------------------------
+    has_conv = ("conv1.weight" in state_a) or any(k.startswith("layer1.") for k in state_a.keys())
+    has_fc1  = ("fc1.weight" in state_a) or any(k.startswith("fc1.") for k in state_a.keys())
 
-    if width_multiplier is None:
-        width_multiplier = infer_width_multiplier_from_state(state_a)
-
-    # Build models exactly like training/stitching does :contentReference[oaicite:6]{index=6}
-    model_a = architectures.build_model(
-        "resnet20",
-        num_classes=num_classes,
-        norm="flax_ln",
-        width_multiplier=int(width_multiplier),
-        shortcut_option=str(shortcut_option),
-    ).to(device).eval()
-
-    model_b = architectures.build_model(
-        "resnet20",
-        num_classes=num_classes,
-        norm="flax_ln",
-        width_multiplier=int(width_multiplier),
-        shortcut_option=str(shortcut_option),
-    ).to(device).eval()
-
-    # Filter checkpoint dicts to exact model keys (prevents strict-load surprises)
-    keys = set(model_a.state_dict().keys())
-    state_a_f = {k: v for k, v in state_a.items() if k in keys}
-    state_b_f = {k: v for k, v in state_b.items() if k in keys}
-    model_a.load_state_dict(state_a_f, strict=True)
-    model_b.load_state_dict(state_b_f, strict=True)
+    if has_fc1 and not has_conv:
+        arch = "mlp"
+    elif has_conv:
+        arch = "resnet20"
+    else:
+        raise ValueError(
+            "Could not infer architecture from state_dict keys. "
+            "Expected either ResNet-like keys (conv1/layer*) or MLP keys (fc1..)."
+        )
 
     perm_names = sorted(ps.perm_to_axes.keys())
 
+    # -------------------------
+    # Build + load models
+    # -------------------------
+    if arch == "mlp":
+        # Infer contiguous fc1..fcN from checkpoint (like your WM script does)
+        pat = re.compile(r"^fc(\d+)\.weight$")
+        layer_ids = sorted({int(pat.match(k).group(1)) for k in state_a.keys() if pat.match(k)})
+        if not layer_ids:
+            raise KeyError("MLP detected, but no fc{n}.weight keys found in state_dict.")
+        n_layers = max(layer_ids)
+        expected = list(range(1, n_layers + 1))
+        if layer_ids != expected:
+            raise ValueError(f"Expected contiguous fc layers {expected}, found {layer_ids}")
+
+        # Repo MLP is fc1..fc4 (3 hidden + classifier). Enforce to avoid silent mismatch.
+        if n_layers != 4:
+            raise ValueError(
+                f"This feature-extractor expects the repo MLP with fc1..fc4. "
+                f"Found fc1..fc{n_layers} in checkpoint."
+            )
+
+        hidden = int(state_a["fc1.weight"].shape[0])
+        in_dim = int(state_a["fc1.weight"].shape[1])
+
+        # Prefer dataset stats for input shape, but fall back if needed
+        stats = ds_utils.DATASET_STATS[dataset_u]
+        c = int(stats["in_channels"])
+        h, w = map(int, stats["image_size"])
+        if c * h * w != in_dim:
+            # Fallback: infer square spatial dims if possible
+            if in_dim % c != 0:
+                raise ValueError(
+                    f"Cannot infer input_shape: fc1.weight has in_dim={in_dim}, "
+                    f"but dataset in_channels={c} does not divide it."
+                )
+            side_f = math.sqrt(in_dim / c)
+            side = int(round(side_f))
+            if side * side * c != in_dim:
+                raise ValueError(
+                    f"Cannot infer input_shape: fc1.weight in_dim={in_dim} not compatible "
+                    f"with square H=W given in_channels={c}."
+                )
+            h = w = side
+
+        input_shape = (c, h, w)
+        num_classes = int(state_a[f"fc{n_layers}.weight"].shape[0])
+
+        model_a = architectures.build_model(
+            "mlp",
+            num_classes=num_classes,
+            input_shape=input_shape,
+            hidden=hidden,
+        ).to(device).eval()
+
+        model_b = architectures.build_model(
+            "mlp",
+            num_classes=num_classes,
+            input_shape=input_shape,
+            hidden=hidden,
+        ).to(device).eval()
+
+        keys = set(model_a.state_dict().keys())
+        state_a_f = {k: v for k, v in state_a.items() if k in keys}
+        state_b_f = {k: v for k, v in state_b.items() if k in keys}
+        model_a.load_state_dict(state_a_f, strict=True)
+        model_b.load_state_dict(state_b_f, strict=True)
+
+        # Map perm name -> (module_name, preprocess_fn, unit_dim)
+        # Perm keys are typically "P1","P2","P3" (hidden layers).
+        _P_OR_DIGIT = re.compile(r"^(?:P)?(\d+)$")
+
+        def _hook_info(pname: str) -> Tuple[str, Optional[Any], int]:
+            m = _P_OR_DIGIT.match(pname)
+            if not m:
+                raise KeyError(f"MLP: don't know how to map perm name to hook layer: {pname}")
+            i = int(m.group(1))
+            # hidden layers correspond to fc1..fc(n_layers-1)
+            if i < 1 or i >= n_layers:
+                raise KeyError(f"MLP: perm {pname} implies fc{i}, but only hidden perms 1..{n_layers-1} exist.")
+            return f"fc{i}", F.relu, 1
+
+    else:
+        # ResNet20
+        # Prefer inferring num_classes from checkpoint if present; otherwise dataset stats.
+        if "linear.weight" in state_a:
+            num_classes = int(state_a["linear.weight"].shape[0])
+        else:
+            num_classes = int(ds_utils.DATASET_STATS[dataset_u]["num_classes"])
+
+        if width_multiplier is None:
+            width_multiplier = infer_width_multiplier_from_state(state_a)
+
+        # Allow caller to pass shortcut_option; if you want full auto, uncomment:
+        # shortcut_option = infer_shortcut_option_from_state(state_a)
+
+        model_a = architectures.build_model(
+            "resnet20",
+            num_classes=num_classes,
+            norm="flax_ln",
+            width_multiplier=int(width_multiplier),
+            shortcut_option=str(shortcut_option),
+        ).to(device).eval()
+
+        model_b = architectures.build_model(
+            "resnet20",
+            num_classes=num_classes,
+            norm="flax_ln",
+            width_multiplier=int(width_multiplier),
+            shortcut_option=str(shortcut_option),
+        ).to(device).eval()
+
+        keys = set(model_a.state_dict().keys())
+        state_a_f = {k: v for k, v in state_a.items() if k in keys}
+        state_b_f = {k: v for k, v in state_b.items() if k in keys}
+        model_a.load_state_dict(state_a_f, strict=True)
+        model_b.load_state_dict(state_b_f, strict=True)
+
+        def _hook_info(pname: str) -> Tuple[str, Optional[Any], int]:
+            return perm_name_to_hook(pname)
+
+    # -------------------------
+    # Forward-hook extraction
+    # -------------------------
     def _extract(model: nn.Module) -> Dict[str, torch.Tensor]:
         store: Dict[str, List[torch.Tensor]] = {p: [] for p in perm_names}
         hooks = []
 
         for p in perm_names:
-            layer_name, preprocess, _unit_dim = perm_name_to_hook(p)
+            layer_name, preprocess, _unit_dim = _hook_info(p)
             mod = _get_submodule_by_name(model, layer_name)
 
             def _make_hook(pname: str, pre):
@@ -667,7 +806,7 @@ def compute_features_from_state_dicts(
             xb = xb.to(device, non_blocking=True)
             _ = model(xb)
             seen += int(xb.shape[0])
-            if samples is not None and samples > 0 and seen >= samples:
+            if samples is not None and seen >= samples:
                 break
 
         for h in hooks:
@@ -678,7 +817,7 @@ def compute_features_from_state_dicts(
             if len(store[p]) == 0:
                 continue
             t = torch.cat(store[p], dim=0)
-            if samples is not None and samples > 0 and t.shape[0] > samples:
+            if samples is not None and t.shape[0] > samples:
                 t = t[:samples]
             out_feats[p] = t
         return out_feats
@@ -889,8 +1028,11 @@ def main():
                         "delta_act_minus_wgt_raw": dH_act["raw_frob"] - dH_wgt["raw_frob"],
                         "delta_act_minus_wgt_rel": dH_act["rel_to_A"] - dH_wgt["rel_to_A"],
                     }
-                    cka_wgt = float(cka_fn(xa, xb_wgt).item())
-                    cka_act = float(cka_fn(xa, xb_act).item())
+                    def _to_float(v):
+                        return float(v.item() if isinstance(v, torch.Tensor) else v)
+
+                    cka_wgt = _to_float(cka_fn(xa, xb_wgt))
+                    cka_act = _to_float(cka_fn(xa, xb_act))
                     entry["cka"] = {
                         "cka_A_vs_Bperm_wgt": cka_wgt,
                         "cka_A_vs_Bperm_act": cka_act,
