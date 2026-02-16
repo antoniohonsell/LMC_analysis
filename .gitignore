@@ -41,6 +41,11 @@ activation_stitching_out_*/
 weight_matching_out_fashionmnist_mlp/
 activation_stitching_out_fashionmnist_mlp/
 # need to handle better the git ignore !!!
+out/
+overall_plots/
+useless_to_push/
+LLFC/
+llfc_results/
 
 # --- Model checkpoints / large files ---
 *.tar.gz
