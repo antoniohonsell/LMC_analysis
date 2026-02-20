@@ -648,7 +648,7 @@ def main() -> None:
             f"Missing in B: {missing_in_b[:20]}{' ...' if len(missing_in_b) > 20 else ''}\n"
             f"Missing in A: {missing_in_a[:20]}{' ...' if len(missing_in_a) > 20 else ''}\n"
         )
-    # -------------------------`
+    # -------------------------
     # OPTIONAL: permute B using a saved weight-matching permutation
     # -------------------------
     if args.wm_perm is not None:
@@ -679,10 +679,31 @@ def main() -> None:
         else:
             raise ValueError(f"--wm_perm currently supported only for arch in {{resnet20, mlp, lightnet}}; got {arch}")
 
+        # Reconcile permutation keys (handle int vs "P#" string keys, common for activation matching)
         needed = set(ps.perm_to_axes.keys())
-        missing = sorted(needed - set(perm.keys()))
+        perm_keys = set(perm.keys())
+        
+        # Try mapping int or digit-string keys -> "P#" string keys (common for activation permutations)
+        if not perm_keys.intersection(needed):
+            # Check if perm has int or digit-string keys that could map to "P#"
+            int_keys = [k for k in perm_keys if isinstance(k, int)]
+            str_digit_keys = [k for k in perm_keys if isinstance(k, str) and k.isdigit()]
+            
+            if int_keys or str_digit_keys:
+                perm_remapped = {}
+                for k, v in perm.items():
+                    if isinstance(k, int) or (isinstance(k, str) and k.isdigit()):
+                        perm_remapped[f"P{k}"] = v
+                    else:
+                        perm_remapped[k] = v
+                perm_keys = set(perm_remapped.keys())
+                perm = perm_remapped
+                print(f"[INFO] Remapped permutation keys to P# format")
+        
+        missing = sorted(needed - perm_keys)
         if missing:
-            raise KeyError(f"--wm_perm is missing permutation keys required by spec: {missing}")
+            raise KeyError(f"--wm_perm is missing permutation keys required by spec: {missing}\n"
+                          f"Available keys in permutation file: {sorted(perm_keys)}")
         perm = {k: v for k, v in perm.items() if k in needed}
 
         # Replace B with P(B)
