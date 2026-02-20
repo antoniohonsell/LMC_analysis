@@ -44,8 +44,8 @@ activation_stitching_out_fashionmnist_mlp/
 out/
 overall_plots/
 useless_to_push/
-LLFC/
 llfc_results/
+LLFC/plot_llfc_avg_by_width.py
 
 # --- Model checkpoints / large files ---
 *.tar.gz
