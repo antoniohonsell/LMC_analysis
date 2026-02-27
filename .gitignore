@@ -46,6 +46,10 @@ overall_plots/
 useless_to_push/
 llfc_results/
 LLFC/plot_llfc_avg_by_width.py
+compare_permutations_res/
+compare_permutations/
+overall_plots_2/
+crh_results/
 
 # --- Model checkpoints / large files ---
 *.tar.gz
