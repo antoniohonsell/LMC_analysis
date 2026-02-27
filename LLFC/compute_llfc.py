@@ -90,15 +90,27 @@ TensorDict = Dict[str, torch.Tensor]
 
 def load_wm_perm_pkl(path: str) -> Dict[str, torch.Tensor]:
     """
-    Load a weight-matching permutation saved as a pickle:
+    Load a weight-matching permutation saved as a pickle or PyTorch file:
       {perm_name: np.ndarray | list | torch.Tensor}
     Returns:
       {perm_name: 1D LongTensor}
     """
-    with open(path, "rb") as f:
-        obj = pickle.load(f)
+    # Try loading as PyTorch first (handles .pt files)
+    if path.endswith(".pt"):
+        try:
+            obj = torch.load(path, map_location="cpu")
+        except Exception as e:
+            raise ValueError(f"Failed to load --wm_perm as PyTorch file: {e}")
+    else:
+        # Fall back to pickle for .pkl files
+        try:
+            with open(path, "rb") as f:
+                obj = pickle.load(f)
+        except Exception as e:
+            raise ValueError(f"Failed to load --wm_perm as pickle file: {e}")
+    
     if not isinstance(obj, dict):
-        raise ValueError(f"--wm_perm must be a pickled dict, got {type(obj)} at {path}")
+        raise ValueError(f"--wm_perm must be a dict, got {type(obj)} at {path}")
     perm: Dict[str, torch.Tensor] = {}
     for k, v in obj.items():
         t = torch.as_tensor(v, dtype=torch.long)
@@ -556,7 +568,7 @@ def main() -> None:
     p.add_argument("--num_workers", type=int, default=0)
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
 
-    p.add_argument("--lambdas", type=int, default=9, help="Number of lambda points in [0,1]")
+    p.add_argument("--lambdas", type=int, default=21, help="Number of lambda points in [0,1]")
     p.add_argument("--max_batches", type=int, default=0, help="0 = full test set; else limit number of batches")
     p.add_argument("--eps", type=float, default=1e-12)
 
@@ -568,7 +580,6 @@ def main() -> None:
     p.add_argument("--no_flatten_input", action="store_true", help="Force NOT flatten input before forward")
 
     args = p.parse_args()
-
     os.makedirs(args.out, exist_ok=True)
     device = torch.device(args.device)
 
