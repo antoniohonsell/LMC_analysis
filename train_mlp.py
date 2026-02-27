@@ -346,6 +346,149 @@ def build_mlp_model(
     # 3) Fallback internal MLP (always works)
     return FallbackMLP(input_dim=input_dim, num_classes=num_classes, hidden_dims=hidden_dims, dropout=dropout)
 
+from dataclasses import dataclass
+from typing import Callable, Sequence, Dict, Any, List, Optional
+import numpy as np
+
+@dataclass
+class LRTuningTrial:
+    lr: float
+    best_val_acc: float
+    best_val_loss: float
+    best_epoch: int
+    run_dir: str
+
+def tune_lr_mlp(
+    *,
+    out_dir: Path,
+    run_prefix: str,
+    model_fn: Callable[[], nn.Module],     # builds a fresh model each trial
+    train_ds: torch.utils.data.Dataset,    # Subset(train_full, train_indices)
+    val_ds: torch.utils.data.Dataset,      # Subset(eval_full, val_indices)
+    device: torch.device,
+    model_seed: int,
+    epochs: int,
+    batch_size: int,
+    num_workers: int,
+    lr_grid: Sequence[float],
+    weight_decay: float,
+) -> Dict[str, Any]:
+    trials: List[LRTuningTrial] = []
+    best_lr: Optional[float] = None
+    best_acc = -1.0
+    best_loss = float("inf")
+
+    for lr in lr_grid:
+        trial_name = f"{run_prefix}_tune_lr{lr:.6g}"
+        trial_dir = out_dir / f"lr_{lr:.6g}"
+        model = model_fn()
+
+        # IMPORTANT: pass test_loader=None so tuning never looks at test
+        summary = train_one_run(
+            run_dir=trial_dir,
+            run_name=trial_name,
+            model=model,
+            train_ds=train_ds,
+            val_ds=val_ds,
+            test_loader=None,                 # requires your small refactor
+            device=device,
+            model_seed=model_seed,
+            epochs=epochs,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            lr=float(lr),
+            weight_decay=float(weight_decay),
+            save_every=epochs + 1,
+        )
+
+        # easiest: read back history.json you already save in train_one_run
+        hist = json.load((trial_dir / "history.json").open("r", encoding="utf-8"))
+        val_accs = [float(x) for x in hist["val_accuracy"]]
+        val_losses = [float(x) for x in hist["val_loss"]]
+
+        best_epoch_idx = int(np.nanargmax(val_accs))
+        trial_best_acc = float(val_accs[best_epoch_idx])
+        trial_best_loss = float(val_losses[best_epoch_idx])
+
+        trials.append(LRTuningTrial(
+            lr=float(lr),
+            best_val_acc=trial_best_acc,
+            best_val_loss=trial_best_loss,
+            best_epoch=best_epoch_idx + 1,
+            run_dir=str(trial_dir),
+        ))
+
+        # pick best by val acc; tie-break by val loss (same pattern as your tuning script) :contentReference[oaicite:4]{index=4}
+        if (trial_best_acc > best_acc) or (trial_best_acc == best_acc and trial_best_loss < best_loss):
+            best_acc = trial_best_acc
+            best_loss = trial_best_loss
+            best_lr = float(lr)
+
+    assert best_lr is not None
+    payload = {
+        "best_lr": best_lr,
+        "best_val_accuracy": best_acc,
+        "best_val_loss": best_loss,
+        "trials": [t.__dict__ for t in trials],
+    }
+    save_json(out_dir / "lr_tuning.json", payload)
+    return payload
+
+def train_full_after_tuning(
+    *,
+    out_dir: Path,
+    run_name: str,
+    model_fn: Callable[[], nn.Module],
+    train_full_ds: torch.utils.data.Dataset,   # Subset(train_full, all_indices)
+    monitor_ds: torch.utils.data.Dataset,      # Subset(eval_full, all_indices) for clean metrics
+    test_loader: DataLoader,
+    device: torch.device,
+    model_seed: int,
+    epochs: int,
+    batch_size: int,
+    num_workers: int,
+    lr: float,
+    weight_decay: float,
+) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    set_seed(model_seed)
+    g = torch.Generator().manual_seed(model_seed)
+
+    train_loader = DataLoader(train_full_ds, batch_size=batch_size, shuffle=True,
+                              num_workers=num_workers, worker_init_fn=seed_worker if num_workers>0 else None,
+                              generator=g, pin_memory=(device.type=="cuda"))
+    monitor_loader = DataLoader(monitor_ds, batch_size=batch_size, shuffle=False,
+                                num_workers=num_workers, pin_memory=(device.type=="cuda"))
+
+    model = model_fn().to(device)
+    crit = nn.CrossEntropyLoss()
+    opt = torch.optim.Adam(model.parameters(), lr=float(lr), weight_decay=float(weight_decay))
+
+    history = train_loop.train(
+        model=model,
+        criterion=crit,
+        optimizer=opt,
+        scheduler=None,
+        train_loader=train_loader,
+        val_loader=monitor_loader,   # not a true “val”, just monitoring
+        epochs=epochs,
+        device=device,
+        save_dir=str(out_dir),
+        run_name=run_name,
+        save_every=max(1, epochs),   # keep files minimal
+        save_last=True,              # ensures *_final.pth exists :contentReference[oaicite:7]{index=7}
+    )
+
+    save_json(out_dir / "history.json", history)
+
+    # optional: evaluate final (or best) on test once, here (this is now “post-selection”)
+    final_ckpt = out_dir / f"{run_name}_final.pth"
+    ckpt = torch.load(final_ckpt, map_location=device)
+    model.load_state_dict(ckpt["state_dict"])
+    test_metrics = evaluate(model, test_loader, crit, device)
+    save_json(out_dir / "test_metrics.json", {"final": test_metrics})
+
 
 # ---------------------------
 # Training orchestration
@@ -432,29 +575,34 @@ def train_one_run(
     save_json(run_dir / "history.json", history)
     save_history_csv(run_dir / "history.csv", history)
 
-    # Evaluate final model on test set
-    final_metrics = evaluate(model, test_loader, criterion, device)
+    # Evaluate final model on test set (skip if test_loader is None, e.g., during LR tuning)
+    metrics = {}
+    summary_test_size = 0
+    if test_loader is not None:
+        final_metrics = evaluate(model, test_loader, criterion, device)
 
-    # Evaluate best checkpoint on test set
-    best_path = run_dir / f"{run_name}_best.pth"
-    best_metrics: Optional[Dict[str, float]] = None
-    if best_path.exists():
-        ckpt = torch.load(best_path, map_location=device)
-        model.load_state_dict(ckpt["state_dict"])
-        best_metrics = evaluate(model, test_loader, criterion, device)
+        # Evaluate best checkpoint on test set
+        best_path = run_dir / f"{run_name}_best.pth"
+        best_metrics: Optional[Dict[str, float]] = None
+        if best_path.exists():
+            ckpt = torch.load(best_path, map_location=device)
+            model.load_state_dict(ckpt["state_dict"])
+            best_metrics = evaluate(model, test_loader, criterion, device)
 
-    metrics = {
-        "final": final_metrics,
-        "best": best_metrics,
-        "train_wallclock_sec": float(t1 - t0),
-    }
+        metrics = {
+            "final": final_metrics,
+            "best": best_metrics,
+            "train_wallclock_sec": float(t1 - t0),
+        }
+        summary_test_size = len(test_loader.dataset)
+    
     save_json(run_dir / "test_metrics.json", metrics)
 
     summary = {
         "run_name": run_name,
         "train_size": len(train_ds),
         "val_size": len(val_ds),
-        "test_size": len(test_loader.dataset),
+        "test_size": summary_test_size,
         "history_last": {k: v[-1] if len(v) else None for k, v in history.items()},
         "test_metrics": metrics,
     }
@@ -512,6 +660,14 @@ def main() -> None:
                         help="Force disable train augmentation (overrides datasets.py default).")
 
     parser.add_argument("--save_every", type=int, default=1)
+
+    # Regime + LR tuning
+    parser.add_argument("--regime", type=str, default="disjoint", choices=["disjoint", "full"],
+                        help="Training regime: 'disjoint' trains on A/B subsets, 'full' trains on full dataset with optional LR tuning.")
+    parser.add_argument("--tune_lr", action="store_true",
+                        help="Enable learning rate tuning in 'full' regime.")
+    parser.add_argument("--lr_grid", nargs="+", type=float, default=[],
+                        help="Grid of learning rates to search over (e.g., 1e-4 3e-4 1e-3).")
 
     args = parser.parse_args()
 
@@ -592,7 +748,8 @@ def main() -> None:
         )
 
         # Save split indices once per dataset
-        ds_root = out_root / dataset_name / "disjoint"
+        regime_dir = "disjoint" if args.regime == "disjoint" else "full"
+        ds_root = out_root / dataset_name / regime_dir
         ds_root.mkdir(parents=True, exist_ok=True)
         split_path = ds_root / f"indices_{dataset_name}_splitseed{args.split_seed}_subsetseed{args.subset_seed}_val{args.val_size}.pt"
         if not split_path.exists():
@@ -633,28 +790,113 @@ def main() -> None:
             "device": str(device),
         })
 
-        # Run all combinations: seed ∈ {0,1} × subset ∈ {A,B}
-        for base_seed in args.seeds:
-            for subset_name, subset_ds, offset in [("A", subset_a, 1), ("B", subset_b, 2)]:
-                # Keep the same convention as train_resnet.py: distinct model seeds per subset
-                model_seed = int(base_seed) * 1000 + offset
+        # Run all combinations based on regime
+        if args.regime == "disjoint":
+            # Run disjoint A/B subset training
+            for base_seed in args.seeds:
+                for subset_name, subset_ds, offset in [("A", subset_a, 1), ("B", subset_b, 2)]:
+                    # Keep the same convention as train_resnet.py: distinct model seeds per subset
+                    model_seed = int(base_seed) * 1000 + offset
 
-                run_dir = ds_root / f"seed_{base_seed}" / f"subset_{subset_name}"
-                run_name = f"{preferred_arch}_{dataset_name}_subset{subset_name}_seed{base_seed}"
+                    run_dir = ds_root / f"seed_{base_seed}" / f"subset_{subset_name}"
+                    run_name = f"{preferred_arch}_{dataset_name}_subset{subset_name}_seed{base_seed}"
 
-                # Build model (prefer repo MLP, else fallback)
-                model = build_mlp_model(
-                    preferred_arch=preferred_arch,
-                    num_classes=num_classes,
-                    in_channels=in_channels,
-                    image_size=image_size,  # (H, W)
-                    hidden_dims=hidden_dims,
-                    dropout=float(args.dropout),
-                )
+                    # Build model (prefer repo MLP, else fallback)
+                    model = build_mlp_model(
+                        preferred_arch=preferred_arch,
+                        num_classes=num_classes,
+                        in_channels=in_channels,
+                        image_size=image_size,  # (H, W)
+                        hidden_dims=hidden_dims,
+                        dropout=float(args.dropout),
+                    )
+
+                    rc = RunConfig(
+                        dataset=dataset_name,
+                        subset=subset_name,
+                        base_seed=int(base_seed),
+                        model_seed=int(model_seed),
+                        split_seed=int(args.split_seed),
+                        subset_seed=int(args.subset_seed),
+                        val_size=int(args.val_size),
+                        epochs=epochs,
+                        batch_size=int(args.batch_size),
+                        num_workers=int(args.num_workers),
+                        optimizer={"type": "Adam", "lr": float(args.lr), "weight_decay": float(args.weight_decay)},
+                        model={"arch": preferred_arch, "hidden_dims": list(hidden_dims), "dropout": float(args.dropout)},
+                        device=str(device),
+                    )
+                    save_json(run_dir / "config.json", asdict(rc))
+
+                    train_one_run(
+                        run_dir=run_dir,
+                        run_name=run_name,
+                        model=model,
+                        train_ds=subset_ds,
+                        val_ds=val_ds,
+                        test_loader=test_loader,
+                        device=device,
+                        model_seed=model_seed,
+                        epochs=epochs,
+                        batch_size=int(args.batch_size),
+                        num_workers=int(args.num_workers),
+                        lr=float(args.lr),
+                        weight_decay=float(args.weight_decay),
+                        save_every=int(args.save_every),
+                    )
+
+        elif args.regime == "full":
+            # Run full dataset training with optional LR tuning
+            for base_seed in args.seeds:
+                model_seed = base_seed * 1000  # model seed for full regime
+                run_dir = ds_root / f"seed_{base_seed}"
+                run_name = f"{preferred_arch}_{dataset_name}_full_seed{base_seed}"
+
+                def model_fn() -> nn.Module:
+                    return build_mlp_model(
+                        preferred_arch=preferred_arch,
+                        num_classes=num_classes,
+                        in_channels=in_channels,
+                        image_size=image_size,
+                        hidden_dims=hidden_dims,
+                        dropout=float(args.dropout),
+                    )
+
+                if args.tune_lr and len(args.lr_grid) > 0:
+                    # 1) Tune LR on train_indices vs val_indices
+                    train_ds_for_tuning = Subset(train_full, train_indices)
+                    val_ds_for_tuning = Subset(eval_full, val_indices)
+
+                    tune_dir = run_dir / "lr_tuning"
+                    tune_result = tune_lr_mlp(
+                        out_dir=tune_dir,
+                        run_prefix=run_name,
+                        model_fn=model_fn,
+                        train_ds=train_ds_for_tuning,
+                        val_ds=val_ds_for_tuning,
+                        device=device,
+                        model_seed=model_seed,
+                        epochs=epochs,
+                        batch_size=int(args.batch_size),
+                        num_workers=int(args.num_workers),
+                        lr_grid=args.lr_grid,
+                        weight_decay=float(args.weight_decay),
+                    )
+                    best_lr = tune_result["best_lr"]
+                else:
+                    best_lr = float(args.lr)
+
+                # 2) Train on full dataset (train_indices + val_indices) with selected LR
+                all_indices = train_indices + val_indices
+                train_full_ds = Subset(train_full, all_indices)
+                monitor_ds = Subset(eval_full, all_indices)
+
+                train_final_dir = run_dir / "final_train"
+                train_final_dir.mkdir(parents=True, exist_ok=True)
 
                 rc = RunConfig(
                     dataset=dataset_name,
-                    subset=subset_name,
+                    subset="full",
                     base_seed=int(base_seed),
                     model_seed=int(model_seed),
                     split_seed=int(args.split_seed),
@@ -663,27 +905,26 @@ def main() -> None:
                     epochs=epochs,
                     batch_size=int(args.batch_size),
                     num_workers=int(args.num_workers),
-                    optimizer={"type": "Adam", "lr": float(args.lr), "weight_decay": float(args.weight_decay)},
+                    optimizer={"type": "Adam", "lr": float(best_lr), "weight_decay": float(args.weight_decay)},
                     model={"arch": preferred_arch, "hidden_dims": list(hidden_dims), "dropout": float(args.dropout)},
                     device=str(device),
                 )
-                save_json(run_dir / "config.json", asdict(rc))
+                save_json(train_final_dir / "config.json", asdict(rc))
 
-                train_one_run(
-                    run_dir=run_dir,
+                train_full_after_tuning(
+                    out_dir=train_final_dir,
                     run_name=run_name,
-                    model=model,
-                    train_ds=subset_ds,
-                    val_ds=val_ds,
+                    model_fn=model_fn,
+                    train_full_ds=train_full_ds,
+                    monitor_ds=monitor_ds,
                     test_loader=test_loader,
                     device=device,
                     model_seed=model_seed,
                     epochs=epochs,
                     batch_size=int(args.batch_size),
                     num_workers=int(args.num_workers),
-                    lr=float(args.lr),
+                    lr=float(best_lr),
                     weight_decay=float(args.weight_decay),
-                    save_every=int(args.save_every),
                 )
 
 
