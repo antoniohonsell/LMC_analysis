@@ -48,7 +48,6 @@ from linear_mode_connectivity.weight_matching_torch import (
 )
 
 import architectures
-import train_resnet  # kept for parity with your repo; not strictly needed
 
 from model_stitching.resnet20_activation_stitching import (
     infer_width_multiplier_from_state,
@@ -412,6 +411,96 @@ def dW_for_perm_key(
 
 
 # -------------------------
+# ε-LLFC helpers
+# -------------------------
+def _parse_lambdas(lams: str) -> List[float]:
+    """
+    Parse comma-separated lambdas like "0,0.25,0.5,0.75,1".
+    """
+    out: List[float] = []
+    for s in lams.split(","):
+        s = s.strip()
+        if not s:
+            continue
+        v = float(s)
+        if v < 0.0 or v > 1.0:
+            raise ValueError(f"--llfc-lambdas must be in [0,1], got {v}")
+        out.append(v)
+    if not out:
+        raise ValueError("--llfc-lambdas parsed to empty list")
+    return out
+
+
+def interpolate_state_dict(
+    a: Dict[str, torch.Tensor],
+    b: Dict[str, torch.Tensor],
+    lam: float,
+) -> Dict[str, torch.Tensor]:
+    """
+    Weight-space linear interpolation: θ_λ = (1-λ)θ_A + λθ_B.
+
+    For floating tensors -> interpolate.
+    For non-floating buffers (ints, counters, etc.) -> keep A's value.
+    """
+    out: Dict[str, torch.Tensor] = {}
+    keys = set(a.keys()).intersection(set(b.keys()))
+    # Keep any A-only keys as-is (should be rare if checkpoints match)
+    for k in a.keys():
+        if k not in keys:
+            out[k] = a[k]
+    for k in keys:
+        va, vb = a[k], b[k]
+        if va.shape != vb.shape:
+            raise ValueError(f"Shape mismatch in state dict at key '{k}': {tuple(va.shape)} vs {tuple(vb.shape)}")
+        if va.dtype.is_floating_point:
+            out[k] = (1.0 - lam) * va + lam * vb
+        else:
+            out[k] = va
+    return out
+
+
+def _llfc_abs_rel(
+    *,
+    ha2: torch.Tensor,
+    hb2: torch.Tensor,
+    hl2: torch.Tensor,
+    lam: float,
+    tau: float,
+) -> Tuple[float, float]:
+    """
+    Absolute ε-LLFC deviation:
+      || H_λ - ((1-λ)H_A + λH_B) ||_F
+
+    Relative variant (your later appendix normalization):
+      abs / ( (1-λ)||H_A||_F + λ||H_B||_F + tau )
+    """
+    # Ensure float for stable norms
+    ha2 = ha2.float()
+    hb2 = hb2.float()
+    hl2 = hl2.float()
+
+    target = (1.0 - lam) * ha2 + lam * hb2
+    diff = hl2 - target
+    abs_err = float(torch.linalg.norm(diff).item())
+
+    scale = (1.0 - lam) * float(torch.linalg.norm(ha2).item()) + lam * float(torch.linalg.norm(hb2).item()) + float(tau)
+    rel_err = abs_err / scale
+    return abs_err, rel_err
+
+
+def _summarize_scalar_list(xs: List[float]) -> Dict[str, float]:
+    if len(xs) == 0:
+        return {"mean": float("nan"), "max": float("nan")}
+    return {"mean": float(np.mean(xs)), "max": float(np.max(xs))}
+
+
+def _format_f(x: float) -> str:
+    if x != x:  # NaN
+        return "nan"
+    return f"{x:.4g}"
+
+
+# -------------------------
 # Feature extraction from checkpoints (ResNet20 + MLP)
 # -------------------------
 _P_INNER_HOOK = re.compile(r"^P_layer(\d+)_(\d+)_inner$")
@@ -447,6 +536,7 @@ def compute_features_from_state_dicts(
     width_multiplier: Optional[int],
     device: torch.device,
     features_dtype: torch.dtype,
+    return_only_a: bool = False,
 ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
     import math
     import re as _re
@@ -530,11 +620,13 @@ def compute_features_from_state_dicts(
         num_classes = int(state_a[f"fc{n_layers}.weight"].shape[0])
 
         model_a = architectures.build_model("mlp", num_classes=num_classes, input_shape=input_shape, hidden=hidden).to(device).eval()
-        model_b = architectures.build_model("mlp", num_classes=num_classes, input_shape=input_shape, hidden=hidden).to(device).eval()
+        if not return_only_a:
+            model_b = architectures.build_model("mlp", num_classes=num_classes, input_shape=input_shape, hidden=hidden).to(device).eval()
 
         keys = set(model_a.state_dict().keys())
         model_a.load_state_dict({k: v for k, v in state_a.items() if k in keys}, strict=True)
-        model_b.load_state_dict({k: v for k, v in state_b.items() if k in keys}, strict=True)
+        if not return_only_a:
+            model_b.load_state_dict({k: v for k, v in state_b.items() if k in keys}, strict=True)
 
         _P_OR_DIGIT = _re.compile(r"^(?:P)?(\d+)$")
 
@@ -563,18 +655,19 @@ def compute_features_from_state_dicts(
             width_multiplier=int(width_multiplier),
             shortcut_option=str(shortcut_option),
         ).to(device).eval()
-
-        model_b = architectures.build_model(
-            "resnet20",
-            num_classes=num_classes,
-            norm="flax_ln",
-            width_multiplier=int(width_multiplier),
-            shortcut_option=str(shortcut_option),
-        ).to(device).eval()
+        if not return_only_a:
+            model_b = architectures.build_model(
+                "resnet20",
+                num_classes=num_classes,
+                norm="flax_ln",
+                width_multiplier=int(width_multiplier),
+                shortcut_option=str(shortcut_option),
+            ).to(device).eval()
 
         keys = set(model_a.state_dict().keys())
         model_a.load_state_dict({k: v for k, v in state_a.items() if k in keys}, strict=True)
-        model_b.load_state_dict({k: v for k, v in state_b.items() if k in keys}, strict=True)
+        if not return_only_a:
+            model_b.load_state_dict({k: v for k, v in state_b.items() if k in keys}, strict=True)
 
         def _hook_info(pname: str):
             layer_name, preprocess, _unit_dim = perm_name_to_hook(pname)
@@ -619,7 +712,7 @@ def compute_features_from_state_dicts(
             out_feats[p] = t
         return out_feats
 
-    return _extract(model_a), _extract(model_b)
+    return _extract(model_a), _extract(model_b) if not return_only_a else None
 
 
 # -------------------------
@@ -653,6 +746,23 @@ def main():
         action="store_true",
         help="If set (and dataset+state_a/state_b provided), also forward the permuted-B models (WM/AM) "
              "and report repr alignment without feature-level permuting.",
+    )
+    ap.add_argument(
+        "--compute-llfc",
+        action="store_true",
+        help="Compute ε-LLFC for raw (A,B) and for A vs permuted-B (wgt/act), over a lambda grid.",
+    )
+    ap.add_argument(
+        "--llfc-lambdas",
+        type=str,
+        default="0,0.25,0.5,0.75,1",
+        help='Comma-separated lambdas in [0,1], e.g. "0,0.1,0.2,...,1".',
+    )
+    ap.add_argument(
+        "--llfc-tau",
+        type=float,
+        default=1e-8,
+        help="Stability constant τ used in relative ε-LLFC normalization.",
     )
 
     args = ap.parse_args()
@@ -859,6 +969,179 @@ def main():
                     }
 
                 entry["repr_alignment"] = out
+
+        # ---- ε-LLFC computation ----
+        llfc_per_key: Dict[str, Any] = {}
+        llfc_summary: Dict[str, Any] = {}
+
+        if args.compute_llfc and (k in llfc_per_key):
+            entry["llfc"] = llfc_per_key[k]
+            if not do_state or ps is None:
+                raise ValueError("--compute-llfc requires --state-a and --state-b (so we can interpolate weights).")
+            if args.dataset is None:
+                raise ValueError("--compute-llfc requires --dataset (so we can forward interpolated models).")
+
+            lambdas = _parse_lambdas(str(args.llfc_lambdas))
+            tau = float(args.llfc_tau)
+
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            dtype = torch.float16 if args.features_dtype == "float16" else torch.float32
+            n_samp = int(args.features_samples)
+            n_samp = n_samp if n_samp > 0 else 0
+
+            shortcut_opt = str(args.shortcut_option) if args.shortcut_option else infer_shortcut_option_from_state(state_a)
+            width_mult = int(args.width_multiplier) if args.width_multiplier is not None else None
+
+            # Always compute endpoint features from states to ensure consistent dataset/split/samples.
+            featsA, featsB_raw = compute_features_from_state_dicts(
+                dataset=str(args.dataset),
+                data_root=str(args.data_root),
+                split=str(args.features_split),
+                samples=n_samp,
+                batch_size=int(args.features_batch_size),
+                num_workers=int(args.features_num_workers),
+                state_a=state_a,
+                state_b=state_b,
+                ps=ps,
+                shortcut_option=shortcut_opt,
+                width_multiplier=width_mult,
+                device=device,
+                features_dtype=dtype,
+            )
+
+            # B aligned by permuting weights (so weight-space interpolation is meaningful)
+            _, featsB_wgt = compute_features_from_state_dicts(
+                dataset=str(args.dataset),
+                data_root=str(args.data_root),
+                split=str(args.features_split),
+                samples=n_samp,
+                batch_size=int(args.features_batch_size),
+                num_workers=int(args.features_num_workers),
+                state_a=state_a,
+                state_b=b_wgt_perm,
+                ps=ps,
+                shortcut_option=shortcut_opt,
+                width_multiplier=width_mult,
+                device=device,
+                features_dtype=dtype,
+            )
+            _, featsB_act = compute_features_from_state_dicts(
+                dataset=str(args.dataset),
+                data_root=str(args.data_root),
+                split=str(args.features_split),
+                samples=n_samp,
+                batch_size=int(args.features_batch_size),
+                num_workers=int(args.features_num_workers),
+                state_a=state_a,
+                state_b=b_act_perm,
+                ps=ps,
+                shortcut_option=shortcut_opt,
+                width_multiplier=width_mult,
+                device=device,
+                features_dtype=dtype,
+            )
+
+            # Flatten once for endpoints
+            common_keys = sorted(set(ps.perm_to_axes.keys()))
+            A2 = {k: activation_to_2d(featsA[k], unit_dim=args.unit_dim) for k in common_keys if k in featsA}
+            B2_raw = {k: activation_to_2d(featsB_raw[k], unit_dim=args.unit_dim) for k in common_keys if k in featsB_raw}
+            B2_wgt = {k: activation_to_2d(featsB_wgt[k], unit_dim=args.unit_dim) for k in common_keys if k in featsB_wgt}
+            B2_act = {k: activation_to_2d(featsB_act[k], unit_dim=args.unit_dim) for k in common_keys if k in featsB_act}
+
+            def _run_variant(name: str, sb: Dict[str, torch.Tensor], B2: Dict[str, torch.Tensor]) -> Dict[str, Any]:
+                abs_all: List[float] = []
+                rel_all: List[float] = []
+                per_k_abs: Dict[str, List[float]] = {k: [] for k in common_keys}
+                per_k_rel: Dict[str, List[float]] = {k: [] for k in common_keys}
+
+                for lam in lambdas:
+                    s_lam = interpolate_state_dict(state_a, sb, lam)
+                    feats_lam, _ = compute_features_from_state_dicts(
+                        dataset=str(args.dataset),
+                        data_root=str(args.data_root),
+                        split=str(args.features_split),
+                        samples=n_samp,
+                        batch_size=int(args.features_batch_size),
+                        num_workers=int(args.features_num_workers),
+                        state_a=s_lam,
+                        state_b=s_lam,
+                        ps=ps,
+                        shortcut_option=shortcut_opt,
+                        width_multiplier=width_mult,
+                        device=device,
+                        features_dtype=dtype,
+                        return_only_a=True,
+                    )
+                    for k in common_keys:
+                        if k not in A2 or k not in B2 or k not in feats_lam:
+                            continue
+                        hl2 = activation_to_2d(feats_lam[k], unit_dim=args.unit_dim)
+                        abs_err, rel_err = _llfc_abs_rel(ha2=A2[k], hb2=B2[k], hl2=hl2, lam=lam, tau=tau)
+                        per_k_abs[k].append(abs_err)
+                        per_k_rel[k].append(rel_err)
+                        abs_all.append(abs_err)
+                        rel_all.append(rel_err)
+
+                # per-key summaries
+                per_key = {}
+                for k in common_keys:
+                    per_key[k] = {
+                        "abs": _summarize_scalar_list(per_k_abs[k]),
+                        "rel": _summarize_scalar_list(per_k_rel[k]),
+                    }
+
+                return {
+                    "name": name,
+                    "lambdas": lambdas,
+                    "tau": tau,
+                    "overall": {
+                        "abs": _summarize_scalar_list(abs_all),
+                        "rel": _summarize_scalar_list(rel_all),
+                    },
+                    "per_key": per_key,
+                }
+
+            llfc_raw = _run_variant("raw", state_b, B2_raw)
+            llfc_wgt = _run_variant("under_wgt_perm", b_wgt_perm, B2_wgt)
+            llfc_act = _run_variant("under_act_perm", b_act_perm, B2_act)
+
+            llfc_summary = {
+                "lambdas": lambdas,
+                "tau": tau,
+                "raw": llfc_raw["overall"],
+                "under_wgt_perm": llfc_wgt["overall"],
+                "under_act_perm": llfc_act["overall"],
+            }
+            report["llfc"] = llfc_summary
+
+            # Attach per-key (so it ends up in the output JSON per layer)
+            for k in common_keys:
+                llfc_per_key[k] = {
+                    "raw": llfc_raw["per_key"].get(k, {}),
+                    "under_wgt_perm": llfc_wgt["per_key"].get(k, {}),
+                    "under_act_perm": llfc_act["per_key"].get(k, {}),
+                }
+
+            # Print a compact "final table"
+            print("\n[LLFC] ε-LLFC summary (over layers in ps, over λ grid)")
+            print(f"  lambdas = {lambdas}")
+            print(f"  tau     = {tau:g}\n")
+
+            header = ["metric", "raw", "wgt_perm", "act_perm"]
+            rows = [
+                ["max_abs", _format_f(llfc_raw["overall"]["abs"]["max"]), _format_f(llfc_wgt["overall"]["abs"]["max"]), _format_f(llfc_act["overall"]["abs"]["max"])],
+                ["mean_abs", _format_f(llfc_raw["overall"]["abs"]["mean"]), _format_f(llfc_wgt["overall"]["abs"]["mean"]), _format_f(llfc_act["overall"]["abs"]["mean"])],
+                ["max_rel", _format_f(llfc_raw["overall"]["rel"]["max"]), _format_f(llfc_wgt["overall"]["rel"]["max"]), _format_f(llfc_act["overall"]["rel"]["max"])],
+                ["mean_rel", _format_f(llfc_raw["overall"]["rel"]["mean"]), _format_f(llfc_wgt["overall"]["rel"]["mean"]), _format_f(llfc_act["overall"]["rel"]["mean"])],
+            ]
+
+            colw = [max(len(str(x)) for x in col) for col in zip(header, *rows)]
+            def _row(xs): return "  " + " | ".join(str(x).ljust(w) for x, w in zip(xs, colw))
+            print(_row(header))
+            print("  " + "-+-".join("-" * w for w in colw))
+            for r in rows:
+                print(_row(r))
+            print()
 
         report["per_key"][k] = entry
 
