@@ -712,7 +712,11 @@ def compute_features_from_state_dicts(
             out_feats[p] = t
         return out_feats
 
-    return _extract(model_a), _extract(model_b) if not return_only_a else None
+    feats_a = _extract(model_a)
+    if return_only_a:
+        return feats_a, {}
+    feats_b = _extract(model_b)
+    return feats_a, feats_b
 
 
 # -------------------------
@@ -827,148 +831,6 @@ def main():
 
         b_wgt_perm = apply_permutation(ps, wgt, state_b)
         b_act_perm = apply_permutation(ps, act, state_b)
-
-        if (args.dataset is not None) and (not have_feat_files):
-            do_cka = True
-            cka_fn = _load_cka_fn()
-
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            dtype = torch.float16 if args.features_dtype == "float16" else torch.float32
-            n_samp = int(args.features_samples)
-            n_samp = n_samp if n_samp > 0 else 0
-
-            shortcut_opt = str(args.shortcut_option) if args.shortcut_option else infer_shortcut_option_from_state(state_a)
-
-            feats_a, feats_b = compute_features_from_state_dicts(
-                dataset=str(args.dataset),
-                data_root=str(args.data_root),
-                split=str(args.features_split),
-                samples=n_samp,
-                batch_size=int(args.features_batch_size),
-                num_workers=int(args.features_num_workers),
-                state_a=state_a,
-                state_b=state_b,
-                ps=ps,
-                shortcut_option=shortcut_opt,
-                width_multiplier=int(args.width_multiplier) if args.width_multiplier is not None else None,
-                device=device,
-                features_dtype=dtype,
-            )
-
-            if args.compare_permuted_weight_model:
-                # Forward *permuted-weight* B models and capture features directly in A indexing
-                _fa, feats_b_from_wgt_model = compute_features_from_state_dicts(
-                    dataset=str(args.dataset),
-                    data_root=str(args.data_root),
-                    split=str(args.features_split),
-                    samples=n_samp,
-                    batch_size=int(args.features_batch_size),
-                    num_workers=int(args.features_num_workers),
-                    state_a=state_a,
-                    state_b=b_wgt_perm,
-                    ps=ps,
-                    shortcut_option=shortcut_opt,
-                    width_multiplier=int(args.width_multiplier) if args.width_multiplier is not None else None,
-                    device=device,
-                    features_dtype=dtype,
-                )
-                _fa, feats_b_from_act_model = compute_features_from_state_dicts(
-                    dataset=str(args.dataset),
-                    data_root=str(args.data_root),
-                    split=str(args.features_split),
-                    samples=n_samp,
-                    batch_size=int(args.features_batch_size),
-                    num_workers=int(args.features_num_workers),
-                    state_a=state_a,
-                    state_b=b_act_perm,
-                    ps=ps,
-                    shortcut_option=shortcut_opt,
-                    width_multiplier=int(args.width_multiplier) if args.width_multiplier is not None else None,
-                    device=device,
-                    features_dtype=dtype,
-                )
-
-    print(f"[INFO] common keys = {len(keys)} (reconcile={strat})")
-
-    for k in keys:
-        p_act = act[k]
-        p_wgt = wgt[k]
-
-        if not is_valid_permutation(p_act):
-            raise ValueError(f"[{k}] activation permutation is not a valid permutation.")
-        if not is_valid_permutation(p_wgt):
-            raise ValueError(f"[{k}] weight permutation is not a valid permutation.")
-        if p_act.numel() != p_wgt.numel():
-            raise ValueError(f"[{k}] size mismatch: {p_act.numel()} vs {p_wgt.numel()}")
-
-        agreement = float((p_act == p_wgt).float().mean().item())
-        q = compose_q(p_wgt, p_act)
-        fixed = float((q == torch.arange(q.numel())).float().mean().item())
-        cs = cycle_summary(q)
-
-        entry: Dict[str, Any] = {
-            "n": int(p_act.numel()),
-            "hamming_agreement": agreement,
-            "fixed_point_fraction_of_Q": fixed,
-            "cycle_summary_of_Q": cs,
-        }
-
-        if do_state and ps is not None:
-            entry["dW_weight_alignment_error"] = {
-                "under_wgt_perm": dW_for_perm_key(perm_key=k, ps=ps, state_a=state_a, state_b_perm=b_wgt_perm),
-                "under_act_perm": dW_for_perm_key(perm_key=k, ps=ps, state_a=state_a, state_b_perm=b_act_perm),
-            }
-
-        if do_cka:
-            if k not in feats_a or k not in feats_b:
-                entry["repr_alignment"] = {"skipped": True, "reason": "missing features for this key"}
-            else:
-                xa = activation_to_2d(feats_a[k], unit_dim=args.unit_dim)
-                xb = activation_to_2d(feats_b[k], unit_dim=args.unit_dim)
-
-                raw_m = repr_alignment_metrics(xa, xb, p=None, cka_fn=cka_fn)
-                wgt_m = repr_alignment_metrics(xa, xb, p=p_wgt, cka_fn=cka_fn)
-                act_m = repr_alignment_metrics(xa, xb, p=p_act, cka_fn=cka_fn)
-
-                out: Dict[str, Any] = {
-                    "raw": raw_m,
-                    "under_wgt_perm": wgt_m,
-                    "under_act_perm": act_m,
-                }
-
-                # deltas (only if not skipped)
-                if not raw_m.get("skipped", False) and not wgt_m.get("skipped", False):
-                    out["delta_wgt_minus_raw"] = {
-                        "dH_raw_frob": wgt_m["dH"]["raw_frob"] - raw_m["dH"]["raw_frob"],
-                        "dH_rel_to_A": wgt_m["dH"]["rel_to_A"] - raw_m["dH"]["rel_to_A"],
-                        "mean_unit_cos": wgt_m["mean_unit_cos"] - raw_m["mean_unit_cos"],
-                        **({"cka": wgt_m["cka"] - raw_m["cka"]} if ("cka" in wgt_m and "cka" in raw_m) else {}),
-                    }
-                if not raw_m.get("skipped", False) and not act_m.get("skipped", False):
-                    out["delta_act_minus_raw"] = {
-                        "dH_raw_frob": act_m["dH"]["raw_frob"] - raw_m["dH"]["raw_frob"],
-                        "dH_rel_to_A": act_m["dH"]["rel_to_A"] - raw_m["dH"]["rel_to_A"],
-                        "mean_unit_cos": act_m["mean_unit_cos"] - raw_m["mean_unit_cos"],
-                        **({"cka": act_m["cka"] - raw_m["cka"]} if ("cka" in act_m and "cka" in raw_m) else {}),
-                    }
-                if not wgt_m.get("skipped", False) and not act_m.get("skipped", False):
-                    out["delta_act_minus_wgt"] = {
-                        "dH_raw_frob": act_m["dH"]["raw_frob"] - wgt_m["dH"]["raw_frob"],
-                        "dH_rel_to_A": act_m["dH"]["rel_to_A"] - wgt_m["dH"]["rel_to_A"],
-                        "mean_unit_cos": act_m["mean_unit_cos"] - wgt_m["mean_unit_cos"],
-                        **({"cka": act_m["cka"] - wgt_m["cka"]} if ("cka" in act_m and "cka" in wgt_m) else {}),
-                    }
-
-                # Optional: compare against features extracted from *permuted-weight* models
-                if args.compare_permuted_weight_model and (k in feats_b_from_wgt_model) and (k in feats_b_from_act_model):
-                    xb_wgt_model = activation_to_2d(feats_b_from_wgt_model[k], unit_dim=args.unit_dim)
-                    xb_act_model = activation_to_2d(feats_b_from_act_model[k], unit_dim=args.unit_dim)
-                    out["from_permuted_weight_model"] = {
-                        "wgt": repr_alignment_metrics(xa, xb_wgt_model, p=None, cka_fn=cka_fn),
-                        "act": repr_alignment_metrics(xa, xb_act_model, p=None, cka_fn=cka_fn),
-                    }
-
-                entry["repr_alignment"] = out
 
         # ---- ε-LLFC computation ----
         llfc_per_key: Dict[str, Any] = {}
@@ -1142,6 +1004,153 @@ def main():
             for r in rows:
                 print(_row(r))
             print()
+
+        if (args.dataset is not None) and (not have_feat_files):
+            do_cka = True
+            cka_fn = _load_cka_fn()
+
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            dtype = torch.float16 if args.features_dtype == "float16" else torch.float32
+            n_samp = int(args.features_samples)
+            n_samp = n_samp if n_samp > 0 else 0
+
+            shortcut_opt = str(args.shortcut_option) if args.shortcut_option else infer_shortcut_option_from_state(state_a)
+
+            feats_a, feats_b = compute_features_from_state_dicts(
+                dataset=str(args.dataset),
+                data_root=str(args.data_root),
+                split=str(args.features_split),
+                samples=n_samp,
+                batch_size=int(args.features_batch_size),
+                num_workers=int(args.features_num_workers),
+                state_a=state_a,
+                state_b=state_b,
+                ps=ps,
+                shortcut_option=shortcut_opt,
+                width_multiplier=int(args.width_multiplier) if args.width_multiplier is not None else None,
+                device=device,
+                features_dtype=dtype,
+            )
+
+            if args.compare_permuted_weight_model:
+                # Forward *permuted-weight* B models and capture features directly in A indexing
+                _fa, feats_b_from_wgt_model = compute_features_from_state_dicts(
+                    dataset=str(args.dataset),
+                    data_root=str(args.data_root),
+                    split=str(args.features_split),
+                    samples=n_samp,
+                    batch_size=int(args.features_batch_size),
+                    num_workers=int(args.features_num_workers),
+                    state_a=state_a,
+                    state_b=b_wgt_perm,
+                    ps=ps,
+                    shortcut_option=shortcut_opt,
+                    width_multiplier=int(args.width_multiplier) if args.width_multiplier is not None else None,
+                    device=device,
+                    features_dtype=dtype,
+                )
+                _fa, feats_b_from_act_model = compute_features_from_state_dicts(
+                    dataset=str(args.dataset),
+                    data_root=str(args.data_root),
+                    split=str(args.features_split),
+                    samples=n_samp,
+                    batch_size=int(args.features_batch_size),
+                    num_workers=int(args.features_num_workers),
+                    state_a=state_a,
+                    state_b=b_act_perm,
+                    ps=ps,
+                    shortcut_option=shortcut_opt,
+                    width_multiplier=int(args.width_multiplier) if args.width_multiplier is not None else None,
+                    device=device,
+                    features_dtype=dtype,
+                )
+
+        if args.compute_llfc and (k in llfc_per_key):
+            entry["llfc"] = llfc_per_key[k]
+
+    print(f"[INFO] common keys = {len(keys)} (reconcile={strat})")
+
+    for k in keys:
+        p_act = act[k]
+        p_wgt = wgt[k]
+
+        if not is_valid_permutation(p_act):
+            raise ValueError(f"[{k}] activation permutation is not a valid permutation.")
+        if not is_valid_permutation(p_wgt):
+            raise ValueError(f"[{k}] weight permutation is not a valid permutation.")
+        if p_act.numel() != p_wgt.numel():
+            raise ValueError(f"[{k}] size mismatch: {p_act.numel()} vs {p_wgt.numel()}")
+
+        agreement = float((p_act == p_wgt).float().mean().item())
+        q = compose_q(p_wgt, p_act)
+        fixed = float((q == torch.arange(q.numel())).float().mean().item())
+        cs = cycle_summary(q)
+
+        entry: Dict[str, Any] = {
+            "n": int(p_act.numel()),
+            "hamming_agreement": agreement,
+            "fixed_point_fraction_of_Q": fixed,
+            "cycle_summary_of_Q": cs,
+        }
+
+        if do_state and ps is not None:
+            entry["dW_weight_alignment_error"] = {
+                "under_wgt_perm": dW_for_perm_key(perm_key=k, ps=ps, state_a=state_a, state_b_perm=b_wgt_perm),
+                "under_act_perm": dW_for_perm_key(perm_key=k, ps=ps, state_a=state_a, state_b_perm=b_act_perm),
+            }
+
+        if do_cka:
+            if k not in feats_a or k not in feats_b:
+                entry["repr_alignment"] = {"skipped": True, "reason": "missing features for this key"}
+            else:
+                xa = activation_to_2d(feats_a[k], unit_dim=args.unit_dim)
+                xb = activation_to_2d(feats_b[k], unit_dim=args.unit_dim)
+
+                raw_m = repr_alignment_metrics(xa, xb, p=None, cka_fn=cka_fn)
+                wgt_m = repr_alignment_metrics(xa, xb, p=p_wgt, cka_fn=cka_fn)
+                act_m = repr_alignment_metrics(xa, xb, p=p_act, cka_fn=cka_fn)
+
+                out: Dict[str, Any] = {
+                    "raw": raw_m,
+                    "under_wgt_perm": wgt_m,
+                    "under_act_perm": act_m,
+                }
+
+                # deltas (only if not skipped)
+                if not raw_m.get("skipped", False) and not wgt_m.get("skipped", False):
+                    out["delta_wgt_minus_raw"] = {
+                        "dH_raw_frob": wgt_m["dH"]["raw_frob"] - raw_m["dH"]["raw_frob"],
+                        "dH_rel_to_A": wgt_m["dH"]["rel_to_A"] - raw_m["dH"]["rel_to_A"],
+                        "mean_unit_cos": wgt_m["mean_unit_cos"] - raw_m["mean_unit_cos"],
+                        **({"cka": wgt_m["cka"] - raw_m["cka"]} if ("cka" in wgt_m and "cka" in raw_m) else {}),
+                    }
+                if not raw_m.get("skipped", False) and not act_m.get("skipped", False):
+                    out["delta_act_minus_raw"] = {
+                        "dH_raw_frob": act_m["dH"]["raw_frob"] - raw_m["dH"]["raw_frob"],
+                        "dH_rel_to_A": act_m["dH"]["rel_to_A"] - raw_m["dH"]["rel_to_A"],
+                        "mean_unit_cos": act_m["mean_unit_cos"] - raw_m["mean_unit_cos"],
+                        **({"cka": act_m["cka"] - raw_m["cka"]} if ("cka" in act_m and "cka" in raw_m) else {}),
+                    }
+                if not wgt_m.get("skipped", False) and not act_m.get("skipped", False):
+                    out["delta_act_minus_wgt"] = {
+                        "dH_raw_frob": act_m["dH"]["raw_frob"] - wgt_m["dH"]["raw_frob"],
+                        "dH_rel_to_A": act_m["dH"]["rel_to_A"] - wgt_m["dH"]["rel_to_A"],
+                        "mean_unit_cos": act_m["mean_unit_cos"] - wgt_m["mean_unit_cos"],
+                        **({"cka": act_m["cka"] - wgt_m["cka"]} if ("cka" in act_m and "cka" in wgt_m) else {}),
+                    }
+
+                # Optional: compare against features extracted from *permuted-weight* models
+                if args.compare_permuted_weight_model and (k in feats_b_from_wgt_model) and (k in feats_b_from_act_model):
+                    xb_wgt_model = activation_to_2d(feats_b_from_wgt_model[k], unit_dim=args.unit_dim)
+                    xb_act_model = activation_to_2d(feats_b_from_act_model[k], unit_dim=args.unit_dim)
+                    out["from_permuted_weight_model"] = {
+                        "wgt": repr_alignment_metrics(xa, xb_wgt_model, p=None, cka_fn=cka_fn),
+                        "act": repr_alignment_metrics(xa, xb_act_model, p=None, cka_fn=cka_fn),
+                    }
+
+                entry["repr_alignment"] = out
+
+
 
         report["per_key"][k] = entry
 
