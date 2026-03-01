@@ -836,8 +836,7 @@ def main():
         llfc_per_key: Dict[str, Any] = {}
         llfc_summary: Dict[str, Any] = {}
 
-        if args.compute_llfc and (k in llfc_per_key):
-            entry["llfc"] = llfc_per_key[k]
+        if args.compute_llfc:
             if not do_state or ps is None:
                 raise ValueError("--compute-llfc requires --state-a and --state-b (so we can interpolate weights).")
             if args.dataset is None:
@@ -1065,8 +1064,6 @@ def main():
                     features_dtype=dtype,
                 )
 
-        if args.compute_llfc and (k in llfc_per_key):
-            entry["llfc"] = llfc_per_key[k]
 
     print(f"[INFO] common keys = {len(keys)} (reconcile={strat})")
 
@@ -1150,7 +1147,8 @@ def main():
 
                 entry["repr_alignment"] = out
 
-
+        if args.compute_llfc and (k in llfc_per_key):
+            entry["llfc"] = llfc_per_key[k]
 
         report["per_key"][k] = entry
 
