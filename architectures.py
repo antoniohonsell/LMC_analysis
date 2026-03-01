@@ -97,6 +97,67 @@ class LambdaLayer(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.lambd(x)
 
+class MNISTMLPReg(nn.Module):
+    """
+    Regularized MNIST MLP (Option A):
+      Flatten -> 256 -> 128 -> 10
+      ReLU + Dropout after each hidden layer.
+
+    Notes:
+      - Designed to generalize well on MNIST without racing to 100% train acc.
+      - Uses explicit fc1/fc2/fc3 names (nice for checkpoint readability).
+    """
+    def __init__(
+        self,
+        num_classes: int = 10,
+        input_shape: Tuple[int, int, int] = (1, 28, 28),
+        hidden_dims: Tuple[int, ...] = (256, 128),
+        dropout: float = 0.25,
+    ):
+        super().__init__()
+        c, h, w = input_shape
+        self._flat = c * h * w
+
+        # Robust: allow hidden_dims of length 0/1/2+
+        if hidden_dims is None or len(hidden_dims) == 0:
+            h1, h2 = 256, 128
+        elif len(hidden_dims) == 1:
+            h1 = int(hidden_dims[0])
+            h2 = max(16, h1 // 2)
+        else:
+            h1, h2 = int(hidden_dims[0]), int(hidden_dims[1])
+
+        self.fc1 = nn.Linear(self._flat, h1)
+        self.fc2 = nn.Linear(h1, h2)
+        self.fc3 = nn.Linear(h2, num_classes)
+
+        p = float(dropout)
+        self.drop1 = nn.Dropout(p=p) if p > 0 else nn.Identity()
+        self.drop2 = nn.Dropout(p=p) if p > 0 else nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.view(x.size(0), -1)
+        x = self.drop1(F.relu(self.fc1(x)))
+        x = self.drop2(F.relu(self.fc2(x)))
+        x = self.fc3(x)
+        return x
+
+
+def mnist_mlp_reg(
+    num_classes: int = 10,
+    *,
+    input_shape: Tuple[int, int, int] = (1, 28, 28),
+    hidden_dims: Tuple[int, ...] = (256, 128),
+    dropout: float = 0.25,
+    **_,  # swallow extra kwargs passed by build_model (in_channels/norm/width_multiplier/...)
+) -> nn.Module:
+    return MNISTMLPReg(
+        num_classes=num_classes,
+        input_shape=input_shape,
+        hidden_dims=hidden_dims,
+        dropout=dropout,
+    )
+
 
 class CIFARBasicBlock(nn.Module):
     expansion = 1
@@ -567,6 +628,9 @@ _MODEL_REGISTRY: Dict[str, Callable[..., nn.Module]] = {
     "LightNet2": lightnet2,   # legacy-ish alias
     "MLP": mlp,
     "mlp": mlp,
+    # Regularized MNIST MLP (Option A)
+    "mnist_mlp_reg": mnist_mlp_reg,
+    "MNIST_MLP_REG": mnist_mlp_reg,  # optional alias
 }
 
 
