@@ -410,6 +410,71 @@ def dW_for_perm_key(
     return {"raw_frob": raw, "rel_to_A": rel, "num_params": num}
 
 
+def print_frobenius_norms_model_a(state_a: Dict[str, torch.Tensor]) -> None:
+    """
+    Compute and print the Frobenius norm of weights of model A at each layer.
+    Organizes output by layer for both MLP (fc layers) and ResNet20 architectures.
+    """
+    if not state_a:
+        print("[INFO] state_a is empty, skipping Frobenius norm computation")
+        return
+    
+    print("\n[INFO] Frobenius Norms of Model A Weights by Layer:")
+    print("-" * 60)
+    
+    # Organize weights by layer
+    layer_norms: Dict[str, Dict[str, float]] = {}
+    
+    for key, tensor in sorted(state_a.items()):
+        if "weight" not in key:
+            continue
+        
+        t = tensor.float()
+        norm = float(torch.linalg.norm(t).item())
+        
+        # Extract layer identifier
+        if "fc" in key:  # MLP layers (fc1, fc2, fc3, etc.)
+            match = re.match(r"fc(\d+)\.weight", key)
+            if match:
+                layer_id = f"FC{match.group(1)}"
+            else:
+                layer_id = key
+        elif "layer" in key:  # ResNet layers (layer1, layer2, layer3)
+            match = re.match(r"layer(\d+)\.(\d+)\.", key)
+            if match:
+                layer_num = match.group(1)
+                block_num = match.group(2)
+                layer_id = f"Layer{layer_num}_Block{block_num}"
+            else:
+                layer_id = key
+        elif "conv" in key:  # Initial conv layer
+            layer_id = "ConvInit"
+        elif "linear" in key or "classifier" in key:
+            layer_id = "OutputLinear"
+        else:
+            layer_id = key
+        
+        if layer_id not in layer_norms:
+            layer_norms[layer_id] = {}
+        layer_norms[layer_id][key] = norm
+    
+    # Print organized results
+    for layer_id in sorted(layer_norms.keys()):
+        print(f"\n{layer_id}:")
+        for param_name in sorted(layer_norms[layer_id].keys()):
+            norm = layer_norms[layer_id][param_name]
+            print(f"  {param_name:50s} : {norm:12.6e}")
+    
+    # Print overall statistics
+    all_norms = [v for layer_dict in layer_norms.values() for v in layer_dict.values()]
+    if all_norms:
+        print(f"\n{'Overall Statistics':50s}")
+        print(f"  {'Mean norm':50s} : {np.mean(all_norms):12.6e}")
+        print(f"  {'Max norm':50s} : {np.max(all_norms):12.6e}")
+        print(f"  {'Min norm':50s} : {np.min(all_norms):12.6e}")
+    print("-" * 60 + "\n")
+
+
 # -------------------------
 # ε-LLFC helpers
 # -------------------------
@@ -724,8 +789,8 @@ def compute_features_from_state_dicts(
 # -------------------------
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--act-perm", type=str, required=True)
-    ap.add_argument("--wgt-perm", type=str, required=True)
+    ap.add_argument("--act-perm", type=str, default=None)
+    ap.add_argument("--wgt-perm", type=str, default=None)
     ap.add_argument("--out-json", type=str, default=None)
 
     ap.add_argument("--features-a", type=str, default=None)
@@ -759,7 +824,7 @@ def main():
     ap.add_argument(
         "--llfc-lambdas",
         type=str,
-        default="0,0.25,0.5,0.75,1",
+        default="0.5",
         help='Comma-separated lambdas in [0,1], e.g. "0,0.1,0.2,...,1".',
     )
     ap.add_argument(
@@ -771,18 +836,33 @@ def main():
 
     args = ap.parse_args()
 
-    act = load_permutations(args.act_perm)
-    wgt = load_permutations(args.wgt_perm)
+    # Load permutations (optional - only if both act and wgt perm paths provided)
+    have_perms = (args.act_perm is not None) and (args.wgt_perm is not None)
+    act: Dict[str, torch.Tensor] = {}
+    wgt: Dict[str, torch.Tensor] = {}
+    keys: List[str] = []
+    strat = "none"
 
-    act, wgt, strat = reconcile_keys(act, wgt)
-    keys = sorted(set(act).intersection(set(wgt)))
-    if not keys:
-        raise RuntimeError(
-            "No overlapping permutation keys between activation and weight matching.\n"
-            f"Reconciliation strategy tried: {strat}\n"
-            f"Activation keys (sample): {list(act.keys())[:10]}\n"
-            f"Weight keys (sample): {list(wgt.keys())[:10]}"
-        )
+    if have_perms:
+        act = load_permutations(args.act_perm)
+        wgt = load_permutations(args.wgt_perm)
+        act, wgt, strat = reconcile_keys(act, wgt)
+        keys = sorted(set(act).intersection(set(wgt)))
+        if not keys:
+            raise RuntimeError(
+                "No overlapping permutation keys between activation and weight matching.\n"
+                f"Reconciliation strategy tried: {strat}\n"
+                f"Activation keys (sample): {list(act.keys())[:10]}\n"
+                f"Weight keys (sample): {list(wgt.keys())[:10]}"
+            )
+    else:
+        # If no permutations provided, just compute norms and exit
+        if (args.state_a is not None) and (args.state_b is not None):
+            state_a = load_state_dict_any(args.state_a)
+            print_frobenius_norms_model_a(state_a)
+            return
+        else:
+            raise ValueError("Either provide --act-perm and --wgt-perm, or provide --state-a and --state-b for norm computation.")
 
     report: Dict[str, Any] = {
         "act_perm_path": args.act_perm,
@@ -809,6 +889,10 @@ def main():
     do_state = (args.state_a is not None) and (args.state_b is not None)
     state_a = load_state_dict_any(args.state_a) if do_state else {}
     state_b = load_state_dict_any(args.state_b) if do_state else {}
+
+    # Compute and print Frobenius norms of model A's weights
+    if do_state:
+        print_frobenius_norms_model_a(state_a)
 
     ps = None
     b_wgt_perm: Dict[str, torch.Tensor] = {}
