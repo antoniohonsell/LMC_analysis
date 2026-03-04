@@ -270,6 +270,54 @@ def load_features(path: str) -> Dict[str, torch.Tensor]:
     return out
 
 
+_NUM_WEIGHT = re.compile(r"^(?:(?:net|model|module)\.)?(\d+)\.weight$")
+_NUM_BIAS   = re.compile(r"^(?:(?:net|model|module)\.)?(\d+)\.bias$")
+
+def canonicalize_sequential_mlp_to_fc(state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """
+    Map Sequential-style Linear layer keys like:
+      '0.weight','0.bias','2.weight','2.bias', ...
+    into:
+      'fc1.weight','fc1.bias','fc2.weight','fc2.bias', ...
+    based on sorted numeric layer indices.
+
+    Only triggers if:
+      - no 'fc1.weight' is present
+      - and we can find >=1 2D weight tensor under numeric keys
+    """
+    if "fc1.weight" in state:
+        return state
+
+    # find candidate numeric "Linear" weights (2D)
+    idxs = []
+    for k, v in state.items():
+        m = _NUM_WEIGHT.match(k)
+        if m and isinstance(v, torch.Tensor) and v.ndim == 2:
+            idxs.append(int(m.group(1)))
+    idxs = sorted(set(idxs))
+    if not idxs:
+        return state
+
+    idx_to_fc = {idx: (i + 1) for i, idx in enumerate(idxs)}
+
+    out: Dict[str, torch.Tensor] = {}
+    for k, v in state.items():
+        mw = _NUM_WEIGHT.match(k)
+        if mw and int(mw.group(1)) in idx_to_fc and v.ndim == 2:
+            j = idx_to_fc[int(mw.group(1))]
+            out[f"fc{j}.weight"] = v
+            continue
+
+        mb = _NUM_BIAS.match(k)
+        if mb and int(mb.group(1)) in idx_to_fc:
+            j = idx_to_fc[int(mb.group(1))]
+            out[f"fc{j}.bias"] = v
+            continue
+
+        out[k] = v
+
+    return out
+
 # -------------------------
 # State dict helpers + alignment metrics
 # -------------------------
@@ -290,6 +338,7 @@ def load_state_dict_any(path: str) -> Dict[str, torch.Tensor]:
         if not isinstance(v, torch.Tensor):
             v = torch.tensor(v)
         out[k] = v.detach().cpu()
+    out = canonicalize_sequential_mlp_to_fc(out)
     return out
 
 
@@ -566,6 +615,25 @@ def _format_f(x: float) -> str:
 
 
 # -------------------------
+# Generic FC MLP Model
+# -------------------------
+class GenericFCMLP(nn.Module):
+    def __init__(self, layer_sizes: List[int]):
+        super().__init__()
+        # layer_sizes = [in_dim, h1, h2, ..., out_dim]
+        self.n_layers = len(layer_sizes) - 1
+        for i in range(1, self.n_layers + 1):
+            setattr(self, f"fc{i}", nn.Linear(layer_sizes[i - 1], layer_sizes[i]))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.view(x.size(0), -1)
+        for i in range(1, self.n_layers):
+            x = F.relu(getattr(self, f"fc{i}")(x))
+        x = getattr(self, f"fc{self.n_layers}")(x)
+        return x
+
+
+# -------------------------
 # Feature extraction from checkpoints (ResNet20 + MLP)
 # -------------------------
 _P_INNER_HOOK = re.compile(r"^P_layer(\d+)_(\d+)_inner$")
@@ -663,8 +731,6 @@ def compute_features_from_state_dicts(
         expected = list(range(1, n_layers + 1))
         if layer_ids != expected:
             raise ValueError(f"Expected contiguous fc layers {expected}, found {layer_ids}")
-        if n_layers != 4:
-            raise ValueError(f"This feature-extractor expects the repo MLP with fc1..fc4. Found fc1..fc{n_layers}.")
 
         hidden = int(state_a["fc1.weight"].shape[0])
         in_dim = int(state_a["fc1.weight"].shape[1])
@@ -681,17 +747,16 @@ def compute_features_from_state_dicts(
                 raise ValueError("Cannot infer square input_shape from fc1.weight")
             h = w = side
 
-        input_shape = (c, h, w)
-        num_classes = int(state_a[f"fc{n_layers}.weight"].shape[0])
+        # infer layer sizes from checkpoint
+        layer_sizes = [in_dim] + [int(state_a[f"fc{i}.weight"].shape[0]) for i in range(1, n_layers + 1)]
 
-        model_a = architectures.build_model("mlp", num_classes=num_classes, input_shape=input_shape, hidden=hidden).to(device).eval()
+        model_a = GenericFCMLP(layer_sizes).to(device).eval()
         if not return_only_a:
-            model_b = architectures.build_model("mlp", num_classes=num_classes, input_shape=input_shape, hidden=hidden).to(device).eval()
+            model_b = GenericFCMLP(layer_sizes).to(device).eval()
 
-        keys = set(model_a.state_dict().keys())
-        model_a.load_state_dict({k: v for k, v in state_a.items() if k in keys}, strict=True)
+        model_a.load_state_dict({k: v for k, v in state_a.items() if k in model_a.state_dict()}, strict=True)
         if not return_only_a:
-            model_b.load_state_dict({k: v for k, v in state_b.items() if k in keys}, strict=True)
+            model_b.load_state_dict({k: v for k, v in state_b.items() if k in model_b.state_dict()}, strict=True)
 
         _P_OR_DIGIT = _re.compile(r"^(?:P)?(\d+)$")
 
@@ -912,6 +977,16 @@ def main():
                 shortcut_option=str(args.shortcut_option),
                 state_dict=state_a,
             )
+
+        # Filter keys to only those that exist in the permutation spec
+        # (handles case where permutation files have more keys than the network has layers)
+        valid_keys = set(ps.perm_to_axes.keys())
+        keys_before = set(keys)
+        keys = sorted(keys_before.intersection(valid_keys))
+        if keys != list(keys_before):
+            excluded = keys_before - valid_keys
+            print(f"[INFO] Filtered out {len(excluded)} invalid permutation keys: {sorted(excluded)}")
+            print(f"[INFO] Processing {len(keys)} valid keys: {keys}")
 
         b_wgt_perm = apply_permutation(ps, wgt, state_b)
         b_act_perm = apply_permutation(ps, act, state_b)
