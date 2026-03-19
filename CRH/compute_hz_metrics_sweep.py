@@ -10,7 +10,7 @@ python scripts/compute_hz_metrics_sweep.py \
   --run_glob "**/MNIST/full/**/final_train" \
   --H_name H.pt \
   --Z_name Z.pt \
-  --k 20
+  --k 5 
 """
 
 
