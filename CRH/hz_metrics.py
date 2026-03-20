@@ -89,6 +89,51 @@ def cosine_fro(H: torch.Tensor, Z: torch.Tensor, eps: float = 1e-30) -> float:
     return float(fro_inner(H, Z) / (nH * nZ))
 
 
+def pearson_correlation(H: torch.Tensor, Z: torch.Tensor) -> float:
+    """
+    Pearson correlation metric between two matrices (Herdin et al., 2005).
+    
+    α(A, B) := (1/K) * (1/d² * Σ(A_ij * B_ij) - 1/d⁴ * Σ(A_ij) * Σ(B_ij))
+    
+    where d² is the total number of elements (d x d for square matrices).
+    K is a normalization factor ensuring α(A, B) ∈ [-1, 1].
+    α = ±1 if and only if A = c₀ * B for some scalar c₀.
+    
+    Returns a value in [-1, 1] where:
+      1 means perfect positive correlation
+      0 means no correlation
+      -1 means perfect negative correlation
+    """
+    d = H.shape[0]
+    d_sq = float(d * d)
+    d_fourth = float(d_sq * d_sq)
+    
+    # Element-wise product sum
+    AB_sum = float(fro_inner(H, Z))
+    
+    # Individual sums
+    A_sum = float(torch.sum(H))
+    B_sum = float(torch.sum(Z))
+    
+    # Compute numerator
+    numerator = (1.0 / d_sq) * AB_sum - (1.0 / d_fourth) * A_sum * B_sum
+    
+    # Compute normalization factor K
+    # K = sqrt((1/d² * Σ(A_ij²) - 1/d⁴ * (Σ(A_ij))²) * (1/d² * Σ(B_ij²) - 1/d⁴ * (Σ(B_ij))²))
+    A_sq_sum = float(torch.sum(H * H))
+    B_sq_sum = float(torch.sum(Z * Z))
+    
+    var_A = (1.0 / d_sq) * A_sq_sum - (1.0 / d_fourth) * A_sum * A_sum
+    var_B = (1.0 / d_sq) * B_sq_sum - (1.0 / d_fourth) * B_sum * B_sum
+    
+    K = math.sqrt(var_A * var_B) if var_A * var_B > 0 else 1.0
+    
+    if K < 1e-30:
+        return 0.0
+    
+    return float(numerator / K)
+
+
 def commutator_norm(H: torch.Tensor, Z: torch.Tensor, eps: float = 1e-30) -> float:
     nH = float(fro_norm(H).clamp_min(eps))
     nZ = float(fro_norm(Z).clamp_min(eps))
@@ -215,18 +260,20 @@ def best_fit_power_residual(
 ) -> Dict[str, float]:
     """
     eps_pow(H,Z) = min_{alpha in grid} min_c ||H - c Z^alpha||_F / ||H||_F
-    Returns best {eps_pow, alpha, c}.
+    Returns best {eps_pow, alpha, c, rho_pow_fro}.
+    rho_pow_fro is the absolute Frobenius distance ||H - c Z^alpha||_F for the best fit.
     """
     nH = float(fro_norm(H).clamp_min(eps))
-    best = {"eps_pow": float("inf"), "alpha": float("nan"), "c": float("nan")}
+    best = {"eps_pow": float("inf"), "alpha": float("nan"), "c": float("nan"), "rho_pow_fro": float("nan")}
 
     for a in alpha_grid:
         Za = spectral_power(Z, float(a), allow_indefinite=allow_indefinite)
         denom = float(fro_inner(Za, Za).clamp_min(eps))
         c = float(fro_inner(H, Za) / denom)
-        e = float(fro_norm(H - c * Za) / nH)
+        residual_abs = float(fro_norm(H - c * Za))
+        e = residual_abs / nH
         if e < best["eps_pow"]:
-            best = {"eps_pow": e, "alpha": float(a), "c": c}
+            best = {"eps_pow": e, "alpha": float(a), "c": c, "rho_pow_fro": residual_abs}
 
     return best
 
@@ -256,6 +303,7 @@ def compute_all_metrics(
 
     eps_lin_val, c_lin = epsilon_lin(H, Z)
     rho = cosine_fro(H, Z)
+    pearson_corr = pearson_correlation(H, Z)
     eps_comm = commutator_norm(H, Z)
     pa = principal_angles_topk(H, Z, k=k)
     pl = powerlaw_fit_eigs(H, Z, eig_tol=eig_tol)
@@ -268,6 +316,7 @@ def compute_all_metrics(
         "eps_lin": eps_lin_val,
         "c_lin": c_lin,
         "rho_fro": rho,
+        "pearson_correlation": pearson_corr,
         "eps_comm": eps_comm,
         "principal_angles_topk": pa,
         "powerlaw_eigs": pl,
