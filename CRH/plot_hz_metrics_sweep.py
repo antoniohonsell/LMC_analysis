@@ -10,6 +10,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+import utils
 
 """
 Example of usage:
@@ -25,6 +26,8 @@ def _ensure_dir(p: Path) -> None:
 
 
 def plot_metric_vs_lr(df: pd.DataFrame, metric: str, outdir: Path) -> None:
+    utils.apply_stitching_trend_style()
+    
     fig = plt.figure()
     ax = fig.add_subplot(111)
 
@@ -43,6 +46,8 @@ def plot_metric_vs_lr(df: pd.DataFrame, metric: str, outdir: Path) -> None:
 
 
 def plot_metric_vs_wd(df: pd.DataFrame, metric: str, outdir: Path) -> None:
+    utils.apply_stitching_trend_style()
+    
     fig = plt.figure()
     ax = fig.add_subplot(111)
 
@@ -65,6 +70,8 @@ def plot_heatmap(df: pd.DataFrame, metric: str, outdir: Path) -> None:
     Heatmap only if grid is rectangular enough; otherwise this will still plot but NaNs appear.
     Rows: weight_decay, Cols: lr
     """
+    utils.apply_stitching_trend_style()
+    
     piv = df.pivot_table(index="weight_decay", columns="lr", values=metric, aggfunc="mean")
     wds = piv.index.to_numpy()
     lrs = piv.columns.to_numpy()
