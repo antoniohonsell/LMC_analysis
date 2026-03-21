@@ -1,0 +1,21 @@
+# Deep learning
+torch
+torchvision
+torchaudio
+
+# Numerics
+numpy
+scipy
+
+# Machine learning utilities
+scikit-learn
+
+# Plotting
+matplotlib
+pandas
+
+# Progress bars
+tqdm
+
+# Optional: parallel processing used in metrics_platonic.py
+# pymp-pypi
