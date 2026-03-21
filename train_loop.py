@@ -60,6 +60,7 @@ def train(
     run_name="run",
     save_every=1,
     save_last=True,
+    resume_from=None,
 ):
     if save_dir is not None:
         os.makedirs(save_dir, exist_ok=True)
@@ -76,8 +77,28 @@ def train(
     train_size = len(train_loader.dataset)
 
     best_val_loss = float("inf")
+    start_epoch = 1
 
-    for epoch in range(1, epochs + 1):
+    if resume_from is not None and os.path.isfile(resume_from):
+        ckpt = torch.load(resume_from, map_location=device)
+        model.load_state_dict(ckpt["state_dict"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        start_epoch = int(ckpt.get("epoch", 0)) + 1
+        if "history" in ckpt:
+            history = ckpt["history"]
+        if "best_val_loss" in ckpt:
+            best_val_loss = float(ckpt["best_val_loss"])
+        # Fast-forward a step-based scheduler (e.g. ScheduledOptimizer) to the
+        # right position so its LR curve is not reset.
+        if scheduler is None and hasattr(optimizer, "step_num"):
+            pass  # step_num already restored via optimizer.load_state_dict
+        elif scheduler is not None:
+            # Epoch-based schedulers (CosineAnnealingLR): step past completed epochs.
+            for _ in range(start_epoch - 1):
+                scheduler.step()
+        print(f"[resume] Loaded '{resume_from}' — continuing from epoch {start_epoch}/{epochs}")
+
+    for epoch in range(start_epoch, epochs + 1):
         model.train()
         running_loss = 0.0
 
