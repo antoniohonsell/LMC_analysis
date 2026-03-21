@@ -34,7 +34,7 @@ OPTIMIZERS = ("sgd", "adamw")
 
 DEFAULTS: Dict[str, Dict[str, Any]] = {
     "mlp": {
-        "dataset": "MNIST",
+        "dataset": "FASHIONMNIST",
         "epochs": 30,
         "batch_size": 256,
         "val_size": 5000,
