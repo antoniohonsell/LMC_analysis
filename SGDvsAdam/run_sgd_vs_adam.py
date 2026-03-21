@@ -3,8 +3,9 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from itertools import combinations
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from torch.utils.data import DataLoader, Subset
 
@@ -29,27 +30,40 @@ from lmc_weight_matching_interp import run_weight_matching_interp  # type: ignor
 from plot_interp_local import load_interp_results, plot_acc, plot_loss  # type: ignore
 
 
+OPTIMIZERS = ("sgd", "adamw")
+
 DEFAULTS: Dict[str, Dict[str, Any]] = {
     "mlp": {
         "dataset": "MNIST",
         "epochs": 30,
         "batch_size": 256,
         "val_size": 5000,
-        "schedule": {"adam": "none", "sgd": "none"},
-        "cosine_eta_min": {"adam": 0.0, "sgd": 0.0},
+        "schedule": {"sgd": "none", "adamw": "none"},
+        "cosine_eta_min": {"sgd": 0.0, "adamw": 0.0},
     },
     "resnet20": {
         "dataset": "CIFAR10",
         "epochs": 200,
         "batch_size": 256,
         "val_size": 5000,
-        "schedule": {"adam": "cosine", "sgd": "warmup_cosine"},
-        "cosine_eta_min": {"adam": 1e-5, "sgd": 0.0},
+        "schedule": {"sgd": "warmup_cosine", "adamw": "cosine"},
+        "cosine_eta_min": {"sgd": 0.0, "adamw": 1e-5},
     },
 }
 
 
-def rerender_named_plots(results_path: Path, out_dir: Path, dataset: str, arch: str, tag: str, width: int | None) -> None:
+# --------------------------------------------------------------------------- #
+# Helpers                                                                      #
+# --------------------------------------------------------------------------- #
+
+def rerender_named_plots(
+    results_path: Path,
+    out_dir: Path,
+    dataset: str,
+    arch: str,
+    tag: str,
+    width: Optional[int],
+) -> None:
     res = load_interp_results(str(results_path))
     out_dir.mkdir(parents=True, exist_ok=True)
     base = "_".join(
@@ -63,7 +77,7 @@ def rerender_named_plots(results_path: Path, out_dir: Path, dataset: str, arch: 
     title = " — ".join(title_parts)
 
     plot_loss(
-        load_interp_results(str(results_path))["lambdas"],
+        res["lambdas"],
         res["train_loss_naive"],
         res["test_loss_naive"],
         res["train_loss_perm"],
@@ -84,7 +98,7 @@ def rerender_named_plots(results_path: Path, out_dir: Path, dataset: str, arch: 
     )
 
 
-def _make_test_loader(test_ds, batch_size: int, num_workers: int):
+def _make_test_loader(test_ds, batch_size: int, num_workers: int) -> DataLoader:
     device = utils.get_device()
     return DataLoader(
         test_ds,
@@ -109,12 +123,12 @@ def _template_cfg(
         dataset=dataset_name,
         arch=arch,
         optimizer_name=optimizer_name,
-        lr=0.0,
-        weight_decay=0.0,
+        lr=0.0,           # overridden after tuning
+        weight_decay=0.0,  # overridden after tuning
         epochs=epochs,
         batch_size=batch_size,
         num_workers=int(args.num_workers),
-        model_seed=int(args.seed),
+        model_seed=0,      # overridden per seed
         split_seed=int(args.split_seed),
         val_size=int(args.val_size_mlp if arch == "mlp" else args.val_size_resnet),
         mlp_hidden=int(args.mlp_hidden),
@@ -132,6 +146,76 @@ def _template_cfg(
     )
 
 
+def _default_hparams_off(arch: str, opt_name: str) -> Tuple[float, float]:
+    """Fallback (lr, wd) when --tune-mode off."""
+    if arch == "mlp" and opt_name == "adamw":
+        return 1e-3, 1e-2
+    if arch == "mlp":   # sgd
+        return 3e-2, 0.0
+    if opt_name == "adamw":
+        return 3e-4, 5e-3
+    # sgd resnet20
+    return 1e-1, 5e-4
+
+
+def _run_lmc_pair(
+    *,
+    arch: str,
+    dataset_name: str,
+    ckpt_a: str,
+    ckpt_b: str,
+    pair_dir: Path,
+    figs_dir: Path,
+    pair_tag: str,
+    width_for_plot: Optional[int],
+    args: argparse.Namespace,
+) -> Dict[str, Any]:
+    """Run weight-matching LMC for one checkpoint pair. Skip if already done."""
+    if (pair_dir / "interp_results.pt").exists():
+        print(f"[skip] LMC '{pair_tag}' already computed.")
+        return {"results_pt": str(pair_dir / "interp_results.pt"), "skipped": True}
+
+    results = run_weight_matching_interp(
+        arch=arch,
+        dataset_name=dataset_name,
+        ckpt_a=ckpt_a,
+        ckpt_b=ckpt_b,
+        out_dir=str(pair_dir),
+        data_root=args.data_root,
+        batch_size=int(args.batch_size_resnet if arch == "resnet20" else args.batch_size_mlp),
+        num_workers=int(args.num_workers),
+        eval_samples=int(args.eval_samples),
+        num_lambdas=int(args.num_lambdas),
+        seed=int(args.split_seed),
+        max_iter=int(args.max_iter),
+        width_multiplier=(int(args.resnet_width) if arch == "resnet20" else None),
+        shortcut_option=(str(args.resnet_shortcut) if arch == "resnet20" else None),
+        norm=(str(args.resnet_norm) if arch == "resnet20" else None),
+        silent=bool(args.silent),
+    )
+    rerender_named_plots(
+        results_path=pair_dir / "interp_results.pt",
+        out_dir=figs_dir,
+        dataset=dataset_name,
+        arch=arch,
+        tag=pair_tag,
+        width=width_for_plot,
+    )
+    mid = len(results["test_loss_naive"]) // 2
+    return {
+        "results_pt": str(pair_dir / "interp_results.pt"),
+        "results_json": str(pair_dir / "interp_results.json"),
+        "summary": {
+            "mid_test_loss_naive": float(results["test_loss_naive"][mid]),
+            "mid_test_loss_perm": float(results["test_loss_perm"][mid]),
+        },
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Main experiment                                                              #
+# --------------------------------------------------------------------------- #
+
 def run_one_experiment(
     *,
     arch: str,
@@ -139,6 +223,8 @@ def run_one_experiment(
     args: argparse.Namespace,
     out_root: Path,
 ) -> Dict[str, Any]:
+    seeds: List[int] = [int(s.strip()) for s in str(args.seeds).split(",") if s.strip()]
+
     setup = prepare_experiment_setup(
         dataset_name=dataset_name,
         data_root=args.data_root,
@@ -151,47 +237,59 @@ def run_one_experiment(
         num_workers=int(args.num_workers),
     )
 
-    exp_dir = out_root / f"{arch}_{dataset_name.lower()}"
+    exp_dir   = out_root / f"{arch}_{dataset_name.lower()}"
     tuning_dir = exp_dir / "tuning"
-    final_dir = exp_dir / "final"
-    lmc_dir = exp_dir / "lmc"
-    figs_dir = exp_dir / "figs"
+    final_dir  = exp_dir / "final"
+    lmc_dir    = exp_dir / "lmc"
+    figs_dir   = exp_dir / "figs"
     exp_dir.mkdir(parents=True, exist_ok=True)
 
     manifest: Dict[str, Any] = {
         "arch": arch,
         "dataset": dataset_name,
-        "selection_rule": "max validation accuracy, tie-break min validation loss",
-        "optimizers": {},
+        "seeds": seeds,
+        "tuning_seed": int(args.tuning_seed),
+        "optimizers": list(OPTIMIZERS),
+        "selection_rule": "max val accuracy, tie-break min val loss",
+        "tuning": {},
+        "final": {opt: {} for opt in OPTIMIZERS},
+        "lmc": {"same_optimizer": {opt: {} for opt in OPTIMIZERS}, "cross_optimizer": {}},
     }
 
+    # Use the full train+val for final training; keep tune split separate.
     full_indices = setup.train_indices + setup.val_indices
     train_full_ds = Subset(setup.train_full, full_indices)
-    monitor_ds = Subset(setup.eval_full, full_indices)
-    train_tune_ds = Subset(setup.train_full, setup.train_indices)
-    val_tune_ds = Subset(setup.eval_full, setup.val_indices)
+    monitor_ds    = Subset(setup.eval_full,  full_indices)
 
-    final_ckpts: Dict[str, str] = {}
-    for opt_name in ("sgd", "adam"):
-        template = _template_cfg(arch=arch, dataset_name=dataset_name, optimizer_name=opt_name, args=args)
+    # ------------------------------------------------------------------ #
+    # Phase 1 — Hyperparameter tuning (single tuning seed per optimizer) #
+    # ------------------------------------------------------------------ #
+    best_hparams: Dict[str, Dict[str, float]] = {}
+    for opt_name in OPTIMIZERS:
+        tuning_summary_path = tuning_dir / opt_name / "tuning_summary.json"
 
         if args.tune_mode.lower() == "off":
-            if arch == "mlp" and opt_name == "adam":
-                best_lr, best_wd = 1e-3, 0.0
-            elif arch == "mlp":
-                best_lr, best_wd = 3e-2, 0.0
-            elif opt_name == "adam":
-                best_lr, best_wd = 3e-4, 5e-4
-            else:
-                best_lr, best_wd = 1e-1, 5e-4
-            tuning_summary = {
+            best_lr, best_wd = _default_hparams_off(arch, opt_name)
+            tuning_summary: Dict[str, Any] = {
                 "selection_rule": "manual defaults (tune_mode=off)",
                 "best_lr": best_lr,
                 "best_weight_decay": best_wd,
                 "trials": [],
             }
-            save_json(tuning_dir / opt_name / "tuning_summary.json", tuning_summary)
+            save_json(tuning_summary_path, tuning_summary)
+
+        elif tuning_summary_path.exists():
+            # Resume: tuning already done on a previous run.
+            print(f"[skip] Tuning for {opt_name} already done — loading saved summary.")
+            with tuning_summary_path.open(encoding="utf-8") as f:
+                tuning_summary = json.load(f)
+
         else:
+            template = _template_cfg(
+                arch=arch, dataset_name=dataset_name,
+                optimizer_name=opt_name, args=args,
+            )
+            template.model_seed = int(args.tuning_seed)
             grid = default_hparam_grid(arch=arch, optimizer_name=opt_name, mode=args.tune_mode)
             tuning_summary = tune_grid(
                 out_dir=tuning_dir / opt_name,
@@ -202,118 +300,154 @@ def run_one_experiment(
                 run_prefix=f"{arch}_{dataset_name}_{opt_name}_tune",
             )
 
-        best_lr = float(tuning_summary["best_lr"])
-        best_wd = float(tuning_summary["best_weight_decay"])
-
-        final_cfg = _template_cfg(arch=arch, dataset_name=dataset_name, optimizer_name=opt_name, args=args)
-        final_cfg.lr = best_lr
-        final_cfg.weight_decay = best_wd
-        final_cfg.save_every = int(max(args.save_every, final_cfg.epochs))
-        final_cfg.save_last = True
-
-        run_name = f"{arch}_{dataset_name}_{opt_name}_final"
-        run_dir = final_dir / opt_name
-        summary = train_run(
-            run_dir=run_dir,
-            run_name=run_name,
-            train_ds=train_full_ds,
-            val_ds=monitor_ds,
-            test_loader=test_loader,
-            cfg=final_cfg,
-        )
-        final_ckpt = str(run_dir / f"{run_name}_final.pth")
-        final_ckpts[opt_name] = final_ckpt
-        manifest["optimizers"][opt_name] = {
-            "best_lr": best_lr,
-            "best_weight_decay": best_wd,
-            "tuning_summary": str(tuning_dir / opt_name / "tuning_summary.json"),
-            "final_summary": summary,
-            "final_ckpt": final_ckpt,
-            "best_ckpt": str(run_dir / f"{run_name}_best.pth"),
+        best_hparams[opt_name] = {
+            "lr": float(tuning_summary["best_lr"]),
+            "wd": float(tuning_summary["best_weight_decay"]),
+        }
+        manifest["tuning"][opt_name] = {
+            "best_lr": best_hparams[opt_name]["lr"],
+            "best_weight_decay": best_hparams[opt_name]["wd"],
+            "summary_path": str(tuning_summary_path),
         }
 
+    # ------------------------------------------------------------------ #
+    # Phase 2 — Train N seeds per optimizer with best hparams            #
+    # ------------------------------------------------------------------ #
+    # final_ckpts[opt_name][seed] = path to _final.pth
+    final_ckpts: Dict[str, Dict[int, str]] = {opt: {} for opt in OPTIMIZERS}
+
+    for opt_name in OPTIMIZERS:
+        for seed in seeds:
+            cfg = _template_cfg(
+                arch=arch, dataset_name=dataset_name,
+                optimizer_name=opt_name, args=args,
+            )
+            cfg.lr           = best_hparams[opt_name]["lr"]
+            cfg.weight_decay = best_hparams[opt_name]["wd"]
+            cfg.model_seed   = seed
+            cfg.save_every   = int(max(args.save_every, cfg.epochs))
+            cfg.save_last    = True
+
+            run_name = f"{arch}_{dataset_name}_{opt_name}_seed{seed}"
+            run_dir  = final_dir / opt_name / f"seed_{seed}"
+
+            summary = train_run(
+                run_dir=run_dir,
+                run_name=run_name,
+                train_ds=train_full_ds,
+                val_ds=monitor_ds,
+                test_loader=test_loader,
+                cfg=cfg,
+            )
+            ckpt_path = str(run_dir / f"{run_name}_final.pth")
+            final_ckpts[opt_name][seed] = ckpt_path
+            manifest["final"][opt_name][f"seed_{seed}"] = {
+                "ckpt":         ckpt_path,
+                "best_ckpt":    str(run_dir / f"{run_name}_best.pth"),
+                "lr":           cfg.lr,
+                "weight_decay": cfg.weight_decay,
+                "summary":      summary,
+            }
+
+    # ------------------------------------------------------------------ #
+    # Phase 3 — LMC for all pairs                                        #
+    # ------------------------------------------------------------------ #
     if not args.skip_lmc:
         width_for_plot = int(args.resnet_width) if arch == "resnet20" else None
-        results = run_weight_matching_interp(
-            arch=arch,
-            dataset_name=dataset_name,
-            ckpt_a=final_ckpts["sgd"],
-            ckpt_b=final_ckpts["adam"],
-            out_dir=str(lmc_dir),
-            data_root=args.data_root,
-            batch_size=int(args.batch_size_resnet if arch == "resnet20" else args.batch_size_mlp),
-            num_workers=int(args.num_workers),
-            eval_samples=int(args.eval_samples),
-            num_lambdas=int(args.num_lambdas),
-            seed=int(args.seed),
-            max_iter=int(args.max_iter),
-            width_multiplier=(int(args.resnet_width) if arch == "resnet20" else None),
-            shortcut_option=(str(args.resnet_shortcut) if arch == "resnet20" else None),
-            norm=(str(args.resnet_norm) if arch == "resnet20" else None),
-            silent=bool(args.silent),
-        )
-        rerender_named_plots(
-            results_path=lmc_dir / "interp_results.pt",
-            out_dir=figs_dir,
-            dataset=dataset_name,
-            arch=arch,
-            tag="sgd_vs_adam",
-            width=width_for_plot,
-        )
-        manifest["lmc"] = {
-            "results_pt": str(lmc_dir / "interp_results.pt"),
-            "results_json": str(lmc_dir / "interp_results.json"),
-            "raw_loss_plot": str(lmc_dir / "interp_loss.png"),
-            "raw_acc_plot": str(lmc_dir / "interp_acc.png"),
-            "figs_dir": str(figs_dir),
-            "summary": {
-                "mid_test_loss_naive": float(results["test_loss_naive"][len(results["test_loss_naive"]) // 2]),
-                "mid_test_loss_perm": float(results["test_loss_perm"][len(results["test_loss_perm"]) // 2]),
-            },
-        }
+
+        # --- Same-optimizer pairs (C(n_seeds, 2) per optimizer) ---
+        for opt_name in OPTIMIZERS:
+            for s1, s2 in combinations(seeds, 2):
+                pair_tag = f"{opt_name}_seed{s1}_vs_seed{s2}"
+                pair_dir = lmc_dir / "same_optimizer" / opt_name / f"seed{s1}_vs_seed{s2}"
+                manifest["lmc"]["same_optimizer"][opt_name][f"seed{s1}_vs_seed{s2}"] = _run_lmc_pair(
+                    arch=arch,
+                    dataset_name=dataset_name,
+                    ckpt_a=final_ckpts[opt_name][s1],
+                    ckpt_b=final_ckpts[opt_name][s2],
+                    pair_dir=pair_dir,
+                    figs_dir=figs_dir,
+                    pair_tag=pair_tag,
+                    width_for_plot=width_for_plot,
+                    args=args,
+                )
+
+        # --- Cross-optimizer pairs (all SGD seeds × all AdamW seeds) ---
+        for s_sgd in seeds:
+            for s_adamw in seeds:
+                pair_tag = f"sgd_seed{s_sgd}_vs_adamw_seed{s_adamw}"
+                pair_dir = lmc_dir / "cross_optimizer" / f"sgd_seed{s_sgd}_vs_adamw_seed{s_adamw}"
+                manifest["lmc"]["cross_optimizer"][pair_tag] = _run_lmc_pair(
+                    arch=arch,
+                    dataset_name=dataset_name,
+                    ckpt_a=final_ckpts["sgd"][s_sgd],
+                    ckpt_b=final_ckpts["adamw"][s_adamw],
+                    pair_dir=pair_dir,
+                    figs_dir=figs_dir,
+                    pair_tag=pair_tag,
+                    width_for_plot=width_for_plot,
+                    args=args,
+                )
 
     save_json(exp_dir / "manifest.json", manifest)
     return manifest
 
 
+# --------------------------------------------------------------------------- #
+# CLI                                                                          #
+# --------------------------------------------------------------------------- #
+
 def main() -> None:
-    p = argparse.ArgumentParser(description="Tune/train SGD vs Adam and compute LMC curves.")
-    p.add_argument("--out-dir", type=str, default="./SGDvsAdam_out")
-    p.add_argument("--data-root", type=str, default="./data")
-    p.add_argument("--which", type=str, default="both", choices=["mlp", "resnet20", "both"])
+    p = argparse.ArgumentParser(
+        description=(
+            "SGD vs AdamW experiment:\n"
+            "  1. Tune lr/wd per optimizer (single tuning seed).\n"
+            "  2. Train N seeds per optimizer with best hparams.\n"
+            "  3. Compute LMC for all same-optimizer and cross-optimizer pairs."
+        )
+    )
+    p.add_argument("--out-dir",    type=str, default="./SGDvsAdam_out")
+    p.add_argument("--data-root",  type=str, default="./data")
+    p.add_argument("--which",      type=str, default="both", choices=["mlp", "resnet20", "both"])
 
-    p.add_argument("--mlp-dataset", type=str, default=DEFAULTS["mlp"]["dataset"], choices=["MNIST", "FASHIONMNIST", "CIFAR10"])
-    p.add_argument("--resnet-dataset", type=str, default=DEFAULTS["resnet20"]["dataset"], choices=["CIFAR10", "CIFAR100"])
+    p.add_argument("--mlp-dataset",    type=str, default=DEFAULTS["mlp"]["dataset"],
+                   choices=["MNIST", "FASHIONMNIST", "CIFAR10"])
+    p.add_argument("--resnet-dataset", type=str, default=DEFAULTS["resnet20"]["dataset"],
+                   choices=["CIFAR10", "CIFAR100"])
 
-    p.add_argument("--epochs-mlp", type=int, default=DEFAULTS["mlp"]["epochs"])
-    p.add_argument("--epochs-resnet", type=int, default=DEFAULTS["resnet20"]["epochs"])
-    p.add_argument("--batch-size-mlp", type=int, default=DEFAULTS["mlp"]["batch_size"])
-    p.add_argument("--batch-size-resnet", type=int, default=DEFAULTS["resnet20"]["batch_size"])
-    p.add_argument("--val-size-mlp", type=int, default=DEFAULTS["mlp"]["val_size"])
-    p.add_argument("--val-size-resnet", type=int, default=DEFAULTS["resnet20"]["val_size"])
-    p.add_argument("--num-workers", type=int, default=4)
+    p.add_argument("--epochs-mlp",       type=int,   default=DEFAULTS["mlp"]["epochs"])
+    p.add_argument("--epochs-resnet",    type=int,   default=DEFAULTS["resnet20"]["epochs"])
+    p.add_argument("--batch-size-mlp",   type=int,   default=DEFAULTS["mlp"]["batch_size"])
+    p.add_argument("--batch-size-resnet",type=int,   default=DEFAULTS["resnet20"]["batch_size"])
+    p.add_argument("--val-size-mlp",     type=int,   default=DEFAULTS["mlp"]["val_size"])
+    p.add_argument("--val-size-resnet",  type=int,   default=DEFAULTS["resnet20"]["val_size"])
+    p.add_argument("--num-workers",      type=int,   default=4)
 
-    p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--split-seed", type=int, default=50)
-    p.add_argument("--save-every", type=int, default=10)
+    p.add_argument("--seeds",       type=str, default="0,1,2",
+                   help="Comma-separated model seeds for the main training runs (default: 0,1,2).")
+    p.add_argument("--tuning-seed", type=int, default=99,
+                   help="Model seed used during hyperparameter tuning (default: 99, kept separate from main seeds).")
+    p.add_argument("--split-seed",  type=int, default=50)
+    p.add_argument("--save-every",  type=int, default=10)
 
-    p.add_argument("--mlp-hidden", type=int, default=512)
+    p.add_argument("--mlp-hidden",  type=int,   default=512)
     p.add_argument("--mlp-dropout", type=float, default=0.0)
 
-    p.add_argument("--resnet-width", type=int, default=16)
-    p.add_argument("--resnet-norm", type=str, default="flax_ln", choices=["bn", "ln", "flax_ln", "none"])
+    p.add_argument("--resnet-width",    type=int, default=16)
+    p.add_argument("--resnet-norm",     type=str, default="flax_ln",
+                   choices=["bn", "ln", "flax_ln", "none"])
     p.add_argument("--resnet-shortcut", type=str, default="C", choices=["A", "B", "C"])
-    p.add_argument("--sgd-momentum", type=float, default=0.9)
-    p.add_argument("--warmup-epochs", type=int, default=1)
+    p.add_argument("--sgd-momentum",    type=float, default=0.9)
+    p.add_argument("--warmup-epochs",   type=int,   default=1)
     p.add_argument("--warmup-lr-start", type=float, default=1e-6)
 
     p.add_argument("--tune-mode", type=str, default="quick", choices=["off", "quick", "full"])
-    p.add_argument("--skip-lmc", action="store_true")
+    p.add_argument("--skip-lmc",  action="store_true")
 
     p.add_argument("--eval-samples", type=int, default=0)
-    p.add_argument("--num-lambdas", type=int, default=25)
-    p.add_argument("--max-iter", type=int, default=100)
-    p.add_argument("--silent", action="store_true")
+    p.add_argument("--num-lambdas",  type=int, default=25)
+    p.add_argument("--max-iter",     type=int, default=100)
+    p.add_argument("--silent",       action="store_true")
     args = p.parse_args()
 
     out_root = Path(args.out_dir)

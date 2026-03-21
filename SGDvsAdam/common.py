@@ -4,6 +4,7 @@ import csv
 import json
 import math
 import os
+import re
 import random
 import sys
 import time
@@ -353,6 +354,16 @@ def _make_optimizer_and_scheduler(model: nn.Module, cfg: TrainConfig, steps_per_
             raise ValueError(f"Unsupported Adam schedule: {cfg.schedule}")
         return optimizer, scheduler
 
+    if opt_name == "adamw":
+        optimizer = torch.optim.AdamW(model.parameters(), lr=float(cfg.lr), weight_decay=float(cfg.weight_decay))
+        if cfg.schedule == "cosine":
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=int(cfg.epochs), eta_min=float(cfg.cosine_eta_min)
+            )
+        elif cfg.schedule != "none":
+            raise ValueError(f"Unsupported AdamW schedule: {cfg.schedule}")
+        return optimizer, scheduler
+
     if opt_name == "sgd":
         if cfg.schedule == "warmup_cosine":
             base_optim = build_sgd_with_param_groups(
@@ -386,6 +397,28 @@ def _make_optimizer_and_scheduler(model: nn.Module, cfg: TrainConfig, steps_per_
     raise ValueError(f"Unsupported optimizer: {cfg.optimizer_name}")
 
 
+def _find_resume_checkpoint(run_dir: Path, run_name: str) -> Optional[str]:
+    """
+    Returns the path of the latest epoch checkpoint to resume from, or None.
+    Returns the string "done" if training already completed (_final.pth exists).
+    """
+    final = run_dir / f"{run_name}_final.pth"
+    if final.exists():
+        return "done"
+
+    epoch_re = re.compile(rf"^{re.escape(run_name)}_epoch(\d+)\.pth$")
+    best_epoch = -1
+    best_path: Optional[str] = None
+    for p in run_dir.glob(f"{run_name}_epoch*.pth"):
+        m = epoch_re.match(p.name)
+        if m:
+            ep = int(m.group(1))
+            if ep > best_epoch:
+                best_epoch = ep
+                best_path = str(p)
+    return best_path
+
+
 def train_run(
     *,
     run_dir: Path,
@@ -396,6 +429,17 @@ def train_run(
     cfg: TrainConfig,
 ) -> Dict[str, Any]:
     run_dir.mkdir(parents=True, exist_ok=True)
+
+    # Auto-resume: if the final checkpoint already exists, reload the saved
+    # summary and return immediately without re-training.
+    resume_ckpt = _find_resume_checkpoint(run_dir, run_name)
+    if resume_ckpt == "done":
+        summary_path = run_dir / "summary.json"
+        if summary_path.exists():
+            with summary_path.open(encoding="utf-8") as f:
+                print(f"[skip] '{run_name}' already complete — loading saved summary.")
+                return json.load(f)
+
     set_seed(int(cfg.model_seed))
 
     device = utils.get_device()
@@ -445,6 +489,7 @@ def train_run(
         run_name=run_name,
         save_every=int(cfg.save_every),
         save_last=bool(cfg.save_last),
+        resume_from=resume_ckpt,
     )
     t1 = time.time()
 
@@ -580,6 +625,18 @@ def default_hparam_grid(arch: str, optimizer_name: str, mode: str = "quick") -> 
         if mode == "quick":
             return {"lr": [3e-2, 1e-1, 2e-1], "wd": [5e-4, 1e-3, 5e-3]}
         return {"lr": [1e-2, 3e-2, 1e-1, 2e-1], "wd": [5e-4, 1e-3, 5e-3]}
+
+    # AdamW grids: same lr ranges as Adam, but weight decay ranges are higher
+    # because AdamW applies true decoupled weight decay (not L2 reg on adapted grad).
+    if arch == "mlp" and optimizer_name == "adamw":
+        if mode == "quick":
+            return {"lr": [3e-4, 1e-3, 3e-3], "wd": [1e-4, 1e-3, 1e-2]}
+        return {"lr": [1e-4, 3e-4, 1e-3, 3e-3], "wd": [1e-5, 1e-4, 1e-3, 1e-2]}
+
+    if arch == "resnet20" and optimizer_name == "adamw":
+        if mode == "quick":
+            return {"lr": [1e-4, 3e-4, 1e-3], "wd": [1e-3, 5e-3, 1e-2]}
+        return {"lr": [1e-4, 3e-4, 1e-3, 3e-3], "wd": [1e-4, 1e-3, 5e-3, 1e-2]}
 
     raise ValueError(f"No default grid for arch={arch}, optimizer={optimizer_name}")
 
