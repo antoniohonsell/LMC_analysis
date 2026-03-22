@@ -29,8 +29,8 @@ python CRH/train_resnet_crh.py \
     --out-dir    "$OUT_DIR" \
     --epochs     "$EPOCHS" \
     --seeds      "$SEEDS" \
-    --batch-size 32 \
-    --tune-mode  quick
+    --batch-size 128 \
+    --tune-mode  off
 
 echo ""
 echo "=== Phase 3: Compute CRH metrics ==="

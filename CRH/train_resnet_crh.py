@@ -59,6 +59,7 @@ from common import (  # type: ignore
     tune_grid,
     utils,
 )
+import torch
 from torch.utils.data import DataLoader, Subset
 
 # Patch common.build_model to support resnet18 without modifying SGDvsAdam.
@@ -265,6 +266,7 @@ def run_dataset(
             run_name = f"resnet18_{dataset_name}_{opt_name}_seed{seed}"
             run_dir  = final_dir / opt_name / f"seed_{seed}"
 
+            torch.cuda.empty_cache()
             print(f"\n[train] {dataset_name} / {opt_name} / seed={seed}")
             summary = train_run(
                 run_dir=run_dir,
