@@ -169,6 +169,7 @@ def _run_lmc_pair(
     pair_tag: str,
     width_for_plot: Optional[int],
     args: argparse.Namespace,
+    wandb_lmc_run: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Run weight-matching LMC for one checkpoint pair. Skip if already done."""
     if (pair_dir / "interp_results.pt").exists():
@@ -201,6 +202,25 @@ def _run_lmc_pair(
         tag=pair_tag,
         width=width_for_plot,
     )
+
+    if wandb_lmc_run is not None:
+        try:
+            import wandb  # type: ignore
+            base = "_".join(
+                [x for x in [dataset_name.lower(), arch.lower(),
+                              f"w{width_for_plot}" if width_for_plot is not None else None,
+                              pair_tag] if x]
+            )
+            log_dict: Dict[str, Any] = {}
+            for kind, key in [("loss_interp", f"lmc/{pair_tag}/loss"), ("acc_interp", f"lmc/{pair_tag}/acc")]:
+                png = figs_dir / f"{base}_{kind}.png"
+                if png.exists():
+                    log_dict[key] = wandb.Image(str(png))
+            if log_dict:
+                wandb_lmc_run.log(log_dict)
+        except Exception:
+            pass
+
     mid = len(results["test_loss_naive"]) // 2
     return {
         "results_pt": str(pair_dir / "interp_results.pt"),
@@ -358,6 +378,20 @@ def run_one_experiment(
     if not args.skip_lmc:
         width_for_plot = int(args.resnet_width) if arch == "resnet20" else None
 
+        _wandb_lmc_run = None
+        if getattr(args, "wandb_project", None):
+            try:
+                import wandb  # type: ignore
+                _wandb_lmc_run = wandb.init(
+                    project=args.wandb_project,
+                    entity=getattr(args, "wandb_entity", None),
+                    name=f"{arch}_{dataset_name}_lmc",
+                    tags=[arch, dataset_name, "lmc"],
+                    reinit=True,
+                )
+            except ImportError:
+                pass
+
         # --- Same-optimizer pairs (C(n_seeds, 2) per optimizer) ---
         for opt_name in OPTIMIZERS:
             for s1, s2 in combinations(seeds, 2):
@@ -373,6 +407,7 @@ def run_one_experiment(
                     pair_tag=pair_tag,
                     width_for_plot=width_for_plot,
                     args=args,
+                    wandb_lmc_run=_wandb_lmc_run,
                 )
 
         # --- Cross-optimizer pairs (all SGD seeds × all AdamW seeds) ---
@@ -390,7 +425,11 @@ def run_one_experiment(
                     pair_tag=pair_tag,
                     width_for_plot=width_for_plot,
                     args=args,
+                    wandb_lmc_run=_wandb_lmc_run,
                 )
+
+        if _wandb_lmc_run is not None:
+            _wandb_lmc_run.finish()
 
     save_json(exp_dir / "manifest.json", manifest)
     return manifest
