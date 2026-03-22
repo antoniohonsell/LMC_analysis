@@ -29,7 +29,7 @@ python CRH/train_resnet_crh.py \
     --out-dir    "$OUT_DIR" \
     --epochs     "$EPOCHS" \
     --seeds      "$SEEDS" \
-    --batch-size 128 \
+    --batch-size 32 \
     --tune-mode  quick
 
 echo ""
