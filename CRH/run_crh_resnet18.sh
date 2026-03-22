@@ -20,6 +20,17 @@ set -e
 
 export CUDA_LAUNCH_BLOCKING=1
 
+python - <<'EOF'
+import torch
+print("PyTorch version:", torch.__version__)
+print("CUDA available:", torch.cuda.is_available())
+if torch.cuda.is_available():
+    props = torch.cuda.get_device_properties(0)
+    print("GPU name:", props.name)
+    print("GPU memory:", props.total_memory // 1024**2, "MB")
+    print("Compute capability:", props.major, props.minor)
+EOF
+
 DATASET="CIFAR10"
 OUT_DIR="./CRH_resnet18_out"
 SEEDS="0,1,2"
