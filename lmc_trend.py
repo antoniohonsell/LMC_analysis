@@ -439,7 +439,7 @@ def _plot_two_methods(
                 xs, ys, yerr=yerrs,
                 fmt="o-", linewidth=3, markersize=9,
                 capsize=7, capthick=2.2,
-                label="Weight matching (mean ± std over λ)",
+                label="Weight Matching (mean ± std over λ)",
             )
             any_plotted = True
 
@@ -450,7 +450,7 @@ def _plot_two_methods(
                 xs, ys, yerr=yerrs,
                 fmt="s-", linewidth=3, markersize=8,
                 capsize=7, capthick=2.2,
-                label="Activation stitching (mean ± std over λ)",
+                label="Activation Matching (mean ± std over λ)",
             )
             any_plotted = True
 
