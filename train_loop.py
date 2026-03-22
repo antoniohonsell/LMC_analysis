@@ -61,6 +61,7 @@ def train(
     save_every=1,
     save_last=True,
     resume_from=None,
+    wandb_run=None,
 ):
     if save_dir is not None:
         os.makedirs(save_dir, exist_ok=True)
@@ -149,6 +150,17 @@ def train(
         history["train_accuracy"].append(train_acc)
         history["val_loss"].append(val_loss)
         history["val_accuracy"].append(val_acc)
+
+        if wandb_run is not None:
+            wandb_run.log(
+                {
+                    "train/loss": train_loss,
+                    "train/accuracy": train_acc,
+                    "val/loss": val_loss,
+                    "val/accuracy": val_acc,
+                },
+                step=epoch,
+            )
 
         # periodic checkpoint
         if save_dir is not None and (epoch % save_every == 0):

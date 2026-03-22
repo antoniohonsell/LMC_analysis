@@ -17,5 +17,8 @@ pandas
 # Progress bars
 tqdm
 
+# Experiment tracking
+wandb
+
 # Optional: parallel processing used in metrics_platonic.py
 # pymp-pypi

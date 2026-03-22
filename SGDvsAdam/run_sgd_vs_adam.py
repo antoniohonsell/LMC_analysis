@@ -338,6 +338,9 @@ def run_one_experiment(
                 val_ds=monitor_ds,
                 test_loader=test_loader,
                 cfg=cfg,
+                wandb_project=getattr(args, "wandb_project", None),
+                wandb_entity=getattr(args, "wandb_entity", None),
+                wandb_tags=[arch, dataset_name, opt_name],
             )
             ckpt_path = str(run_dir / f"{run_name}_final.pth")
             final_ckpts[opt_name][seed] = ckpt_path
@@ -443,6 +446,11 @@ def main() -> None:
 
     p.add_argument("--tune-mode", type=str, default="quick", choices=["off", "quick", "full"])
     p.add_argument("--skip-lmc",  action="store_true")
+
+    p.add_argument("--wandb-project", type=str, default=None,
+                   help="W&B project name. If set, final training runs are logged to Weights & Biases.")
+    p.add_argument("--wandb-entity",  type=str, default=None,
+                   help="W&B entity (username or team). Leave unset to use your default entity.")
 
     p.add_argument("--eval-samples", type=int, default=0)
     p.add_argument("--num-lambdas",  type=int, default=25)

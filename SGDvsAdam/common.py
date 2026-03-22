@@ -427,6 +427,9 @@ def train_run(
     val_ds: Dataset,
     test_loader: Optional[DataLoader],
     cfg: TrainConfig,
+    wandb_project: Optional[str] = None,
+    wandb_entity: Optional[str] = None,
+    wandb_tags: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -441,6 +444,21 @@ def train_run(
                 return json.load(f)
 
     set_seed(int(cfg.model_seed))
+
+    _wandb_run = None
+    if wandb_project is not None:
+        try:
+            import wandb  # type: ignore
+            _wandb_run = wandb.init(
+                project=wandb_project,
+                entity=wandb_entity,
+                name=run_name,
+                config=asdict(cfg),
+                tags=wandb_tags or [],
+                reinit=True,
+            )
+        except ImportError:
+            print("[wandb] wandb not installed — skipping W&B logging.")
 
     device = utils.get_device()
     g_loader = torch.Generator().manual_seed(int(cfg.model_seed))
@@ -490,6 +508,7 @@ def train_run(
         save_every=int(cfg.save_every),
         save_last=bool(cfg.save_last),
         resume_from=resume_ckpt,
+        wandb_run=_wandb_run,
     )
     t1 = time.time()
 
@@ -528,6 +547,18 @@ def train_run(
         "final_ckpt": str(run_dir / f"{run_name}_final.pth"),
     }
     save_json(run_dir / "summary.json", summary)
+
+    if _wandb_run is not None:
+        _wandb_run.summary["best_val_accuracy"] = best_val_acc
+        _wandb_run.summary["best_val_loss"] = best_val_loss
+        _wandb_run.summary["best_epoch"] = summary["best_epoch"]
+        if test_loader is not None and "final" in metrics and metrics["final"]:
+            _wandb_run.summary["test/final_accuracy"] = metrics["final"]["accuracy"]
+            _wandb_run.summary["test/final_loss"] = metrics["final"]["loss"]
+        if test_loader is not None and "best" in metrics and metrics["best"]:
+            _wandb_run.summary["test/best_accuracy"] = metrics["best"]["accuracy"]
+            _wandb_run.summary["test/best_loss"] = metrics["best"]["loss"]
+        _wandb_run.finish()
 
     del model
     if device.type == "cuda":
