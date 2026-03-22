@@ -90,6 +90,11 @@ def plot_loss(
     out_png: str,
     out_pdf: Optional[str] = None,
 ) -> None:
+    lambdas    = _to_np(lambdas).astype(float)
+    train_naive = _to_np(train_naive).astype(float)
+    test_naive  = _to_np(test_naive).astype(float)
+    train_perm  = _to_np(train_perm).astype(float)
+    test_perm   = _to_np(test_perm).astype(float)
     _setup_plotting_style()
     fig = plt.figure()
     ax = fig.add_subplot(111)
@@ -120,6 +125,11 @@ def plot_acc(
     out_png: str,
     out_pdf: Optional[str] = None,
 ) -> None:
+    lambdas     = _to_np(lambdas).astype(float)
+    train_naive = _to_np(train_naive).astype(float)
+    test_naive  = _to_np(test_naive).astype(float)
+    train_perm  = _to_np(train_perm).astype(float)
+    test_perm   = _to_np(test_perm).astype(float)
     _setup_plotting_style()
     fig = plt.figure()
     ax = fig.add_subplot(111)
