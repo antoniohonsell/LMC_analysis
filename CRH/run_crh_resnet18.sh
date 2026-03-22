@@ -18,7 +18,6 @@ source /home/3199937/envs/lmc_analysis/bin/activate
 
 set -e
 
-export PYTORCH_CUDA_ALLOC_CONF=backend:cudaMallocAsync
 
 python - <<'EOF'
 import torch
@@ -47,7 +46,7 @@ python CRH/train_resnet_crh.py \
     --out-dir    "$OUT_DIR" \
     --epochs     "$EPOCHS" \
     --seeds      "$SEEDS" \
-    --batch-size 32 \
+    --batch-size 128 \
     --tune-mode  off
 
 echo ""
