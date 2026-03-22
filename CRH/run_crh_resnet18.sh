@@ -25,11 +25,12 @@ EPOCHS=200
 
 echo "=== Phase 1+2: Train ResNet18 on $DATASET ==="
 python CRH/train_resnet_crh.py \
-    --dataset "$DATASET" \
-    --out-dir  "$OUT_DIR" \
-    --epochs   "$EPOCHS" \
-    --seeds    "$SEEDS" \
-    --tune-mode quick
+    --dataset    "$DATASET" \
+    --out-dir    "$OUT_DIR" \
+    --epochs     "$EPOCHS" \
+    --seeds      "$SEEDS" \
+    --batch-size 128 \
+    --tune-mode  quick
 
 echo ""
 echo "=== Phase 3: Compute CRH metrics ==="
