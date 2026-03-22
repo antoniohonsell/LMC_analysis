@@ -18,7 +18,6 @@ source /home/3199937/envs/lmc_analysis/bin/activate
 
 set -e
 
-export CUDA_LAUNCH_BLOCKING=1
 export PYTORCH_CUDA_ALLOC_CONF=backend:cudaMallocAsync
 
 python - <<'EOF'
@@ -28,8 +27,13 @@ print("CUDA available:", torch.cuda.is_available())
 if torch.cuda.is_available():
     props = torch.cuda.get_device_properties(0)
     print("GPU name:", props.name)
-    print("GPU memory:", props.total_memory // 1024**2, "MB")
+    print("GPU total memory:", props.total_memory // 1024**2, "MB")
     print("Compute capability:", props.major, props.minor)
+    # force CUDA init to measure real free memory
+    torch.zeros(1).cuda()
+    free, total = torch.cuda.mem_get_info(0)
+    print("GPU free memory:", free // 1024**2, "MB")
+    print("GPU used memory:", (total - free) // 1024**2, "MB")
 EOF
 
 DATASET="CIFAR10"
@@ -43,7 +47,7 @@ python CRH/train_resnet_crh.py \
     --out-dir    "$OUT_DIR" \
     --epochs     "$EPOCHS" \
     --seeds      "$SEEDS" \
-    --batch-size 128 \
+    --batch-size 32 \
     --tune-mode  off
 
 echo ""
