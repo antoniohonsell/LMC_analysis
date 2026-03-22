@@ -260,11 +260,18 @@ def best_fit_power_residual(
 ) -> Dict[str, float]:
     """
     eps_pow(H,Z) = min_{alpha in grid} min_c ||H - c Z^alpha||_F / ||H||_F
-    Returns best {eps_pow, alpha, c, rho_pow_fro}.
-    rho_pow_fro is the absolute Frobenius distance ||H - c Z^alpha||_F for the best fit.
+    Returns best {eps_pow, alpha, c, rho_pow_fro, cosine_pow}.
+    cosine_pow is the Frobenius cosine similarity between H and Z^alpha at the best alpha.
     """
     nH = float(fro_norm(H).clamp_min(eps))
-    best = {"eps_pow": float("inf"), "alpha": float("nan"), "c": float("nan"), "rho_pow_fro": float("nan")}
+    best: Dict[str, float] = {
+        "eps_pow":     float("inf"),
+        "alpha":       float("nan"),
+        "c":           float("nan"),
+        "rho_pow_fro": float("nan"),
+        "cosine_pow":  float("nan"),
+        "r2_pow":      float("nan"),
+    }
 
     for a in alpha_grid:
         Za = spectral_power(Z, float(a), allow_indefinite=allow_indefinite)
@@ -273,7 +280,16 @@ def best_fit_power_residual(
         residual_abs = float(fro_norm(H - c * Za))
         e = residual_abs / nH
         if e < best["eps_pow"]:
-            best = {"eps_pow": e, "alpha": float(a), "c": c, "rho_pow_fro": residual_abs}
+            nZa = float(fro_norm(Za).clamp_min(eps))
+            cos_pow = float(fro_inner(H, Za) / (nH * nZa))
+            best = {
+                "eps_pow":     e,
+                "alpha":       float(a),
+                "c":           c,
+                "rho_pow_fro": residual_abs,
+                "cosine_pow":  cos_pow,
+                "r2_pow":      cos_pow ** 2,   # = 1 - eps_pow^2, fraction of variance explained
+            }
 
     return best
 
@@ -302,7 +318,7 @@ def compute_all_metrics(
         Z = symmetrize(Z)
 
     eps_lin_val, c_lin = epsilon_lin(H, Z)
-    rho = cosine_fro(H, Z)
+    cosine_sim = cosine_fro(H, Z)
     pearson_corr = pearson_correlation(H, Z)
     eps_comm = commutator_norm(H, Z)
     pa = principal_angles_topk(H, Z, k=k)
@@ -315,7 +331,7 @@ def compute_all_metrics(
         "shape": list(H.shape),
         "eps_lin": eps_lin_val,
         "c_lin": c_lin,
-        "rho_fro": rho,
+        "cosine_sim_fro": cosine_sim,
         "pearson_correlation": pearson_corr,
         "eps_comm": eps_comm,
         "principal_angles_topk": pa,

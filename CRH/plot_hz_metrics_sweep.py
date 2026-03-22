@@ -124,7 +124,7 @@ def main() -> None:
 
     metrics: List[str] = [
         "eps_lin",
-        "rho_fro",
+        "cosine_sim_fro",
         "eps_comm",
         "pa_mean_cos",
         "pa_max_angle_deg",

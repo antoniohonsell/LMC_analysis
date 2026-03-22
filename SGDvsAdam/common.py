@@ -270,13 +270,6 @@ def build_model(
             width_multiplier=int(resnet_width),
             shortcut_option=str(resnet_shortcut),
         )
-    if arch_l == "resnet18":
-        return architectures.build_model(
-            "resnet18",
-            num_classes=num_classes,
-            in_channels=in_channels,
-            norm=str(resnet_norm),
-        )
     raise ValueError(f"Unsupported arch: {arch}")
 
 
@@ -672,16 +665,6 @@ def default_hparam_grid(arch: str, optimizer_name: str, mode: str = "quick") -> 
         return {"lr": [1e-4, 3e-4, 1e-3, 3e-3], "wd": [1e-5, 1e-4, 1e-3, 1e-2]}
 
     if arch == "resnet20" and optimizer_name == "adamw":
-        if mode == "quick":
-            return {"lr": [1e-4, 3e-4, 1e-3], "wd": [1e-3, 5e-3, 1e-2]}
-        return {"lr": [1e-4, 3e-4, 1e-3, 3e-3], "wd": [1e-4, 1e-3, 5e-3, 1e-2]}
-
-    if arch == "resnet18" and optimizer_name == "sgd":
-        if mode == "quick":
-            return {"lr": [3e-2, 1e-1, 2e-1], "wd": [5e-4, 1e-3, 5e-3]}
-        return {"lr": [1e-2, 3e-2, 1e-1, 2e-1], "wd": [5e-4, 1e-3, 5e-3]}
-
-    if arch == "resnet18" and optimizer_name in ("adam", "adamw"):
         if mode == "quick":
             return {"lr": [1e-4, 3e-4, 1e-3], "wd": [1e-3, 5e-3, 1e-2]}
         return {"lr": [1e-4, 3e-4, 1e-3, 3e-3], "wd": [1e-4, 1e-3, 5e-3, 1e-2]}
