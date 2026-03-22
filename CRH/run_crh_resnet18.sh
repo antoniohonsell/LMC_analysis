@@ -19,6 +19,7 @@ source /home/3199937/envs/lmc_analysis/bin/activate
 set -e
 
 export CUDA_LAUNCH_BLOCKING=1
+export PYTORCH_CUDA_ALLOC_CONF=backend:cudaMallocAsync
 
 python - <<'EOF'
 import torch
