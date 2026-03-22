@@ -18,6 +18,8 @@ source /home/3199937/envs/lmc_analysis/bin/activate
 
 set -e
 
+export CUDA_LAUNCH_BLOCKING=1
+
 DATASET="CIFAR10"
 OUT_DIR="./CRH_resnet18_out"
 SEEDS="0,1,2"
