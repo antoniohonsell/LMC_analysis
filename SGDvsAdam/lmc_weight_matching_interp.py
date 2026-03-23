@@ -28,6 +28,7 @@ from linear_mode_connectivity.weight_matching_torch import (  # type: ignore
     apply_permutation,
     permutation_spec_from_axes_to_perm,
     resnet20_layernorm_permutation_spec,
+    resnet50_permutation_spec,
     weight_matching,
 )
 
@@ -211,6 +212,42 @@ def infer_norm_from_state(state: Dict[str, torch.Tensor]) -> str:
     return "ln"
 
 
+def has_batch_norm(model: nn.Module) -> bool:
+    return any(isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d))
+               for m in model.modules())
+
+
+@torch.no_grad()
+def reset_bn_stats(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    max_batches: int = 50,
+) -> None:
+    """
+    Recalculate BatchNorm running statistics for an interpolated model.
+
+    After weight interpolation the stored running_mean/running_var are no longer
+    representative of the merged model's activations, causing an artificial loss
+    barrier.  Running a few forward passes in train mode (no weight update) fixes
+    this.  Using momentum=None gives a cumulative moving average, which is more
+    accurate than the default exponential average for a small number of batches.
+    """
+    bn_mods = [m for m in model.modules()
+               if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d))]
+    if not bn_mods:
+        return
+    for m in bn_mods:
+        m.reset_running_stats()
+        m.momentum = None  # cumulative moving average: uses 1/n each step
+    model.train()
+    for bi, (x, _) in enumerate(loader):
+        if bi >= max_batches:
+            break
+        model(x.to(device))
+    model.eval()
+
+
 def make_loaders(
     dataset_name: str,
     data_root: str,
@@ -296,6 +333,7 @@ def run_weight_matching_interp(
     shortcut_option: Optional[str] = None,
     norm: Optional[str] = None,
     silent: bool = False,
+    bn_reset_batches: int = 50,
 ) -> Dict[str, Any]:
     arch_l = arch.strip().lower()
     os.makedirs(out_dir, exist_ok=True)
@@ -336,6 +374,22 @@ def run_weight_matching_interp(
         ps = resnet20_layernorm_permutation_spec(shortcut_option=str(shortcut_option), state_dict=state_a_full)
         width_multiplier_out = int(width_multiplier)
         shortcut_out = str(shortcut_option)
+        norm_out = str(norm)
+    elif arch_l == "resnet50":
+        if norm is None:
+            norm = infer_norm_from_state(state_a_raw)
+        model = architectures.build_model(
+            "resnet50",
+            num_classes=infer_num_classes_from_state(state_a_raw),
+            in_channels=infer_in_channels_from_state(state_a_raw) or int(datasets.DATASET_STATS[dataset_name]["in_channels"]),
+            norm=norm,
+        ).to(device)
+        model_keys = set(model.state_dict().keys())
+        state_a_full = {k: v for k, v in state_a_raw.items() if k in model_keys}
+        state_b_full = {k: v for k, v in state_b_raw.items() if k in model_keys}
+        ps = resnet50_permutation_spec(state_dict=state_a_full)
+        width_multiplier_out = None
+        shortcut_out = None
         norm_out = str(norm)
     else:
         raise ValueError(f"Unsupported arch: {arch}")
@@ -383,6 +437,8 @@ def run_weight_matching_interp(
     for lam in lambdas:
         interp_sd = interpolate_state_dict(state_a_dev, state_b_dev, float(lam))
         model.load_state_dict(interp_sd, strict=True)
+        if bn_reset_batches > 0 and has_batch_norm(model):
+            reset_bn_stats(model, train_loader, device, max_batches=bn_reset_batches)
         tl, ta = eval_loss_acc(model, train_loader, device, max_batches=max_batches_train)
         vl, va = eval_loss_acc(model, test_loader, device, max_batches=max_batches_test)
         train_loss_naive.append(tl)
@@ -393,6 +449,8 @@ def run_weight_matching_interp(
     for lam in lambdas:
         interp_sd = interpolate_state_dict(state_a_dev, state_b_perm_dev, float(lam))
         model.load_state_dict(interp_sd, strict=True)
+        if bn_reset_batches > 0 and has_batch_norm(model):
+            reset_bn_stats(model, train_loader, device, max_batches=bn_reset_batches)
         tl, ta = eval_loss_acc(model, train_loader, device, max_batches=max_batches_train)
         vl, va = eval_loss_acc(model, test_loader, device, max_batches=max_batches_test)
         train_loss_perm.append(tl)
@@ -446,7 +504,7 @@ def run_weight_matching_interp(
 
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("--arch", type=str, required=True, choices=["mlp", "resnet20"])
+    p.add_argument("--arch", type=str, required=True, choices=["mlp", "resnet20", "resnet50"])
     p.add_argument("--dataset", type=str, required=True)
     p.add_argument("--data-root", type=str, default="./data")
     p.add_argument("--ckpt-a", type=str, required=True)
@@ -462,6 +520,9 @@ def main() -> None:
     p.add_argument("--shortcut-option", type=str, default=None, choices=[None, "A", "B", "C"])
     p.add_argument("--norm", type=str, default=None)
     p.add_argument("--silent", action="store_true")
+    p.add_argument("--bn-reset-batches", type=int, default=50,
+                   help="Batches used to recalculate BN stats after each interpolation. "
+                        "0 = disabled (no recalculation).")
     args = p.parse_args()
 
     results = run_weight_matching_interp(
@@ -481,6 +542,7 @@ def main() -> None:
         shortcut_option=args.shortcut_option,
         norm=args.norm,
         silent=args.silent,
+        bn_reset_batches=args.bn_reset_batches,
     )
     print(json.dumps(results, indent=2))
 

@@ -49,6 +49,14 @@ DEFAULTS: Dict[str, Dict[str, Any]] = {
         "schedule": {"sgd": "warmup_cosine", "adamw": "cosine"},
         "cosine_eta_min": {"sgd": 0.0, "adamw": 1e-5},
     },
+    "resnet50": {
+        "dataset": "CIFAR100",
+        "epochs": 200,
+        "batch_size": 128,
+        "val_size": 5000,
+        "schedule": {"sgd": "warmup_cosine", "adamw": "cosine"},
+        "cosine_eta_min": {"sgd": 0.0, "adamw": 1e-5},
+    },
 }
 
 
@@ -118,7 +126,7 @@ def _template_cfg(
 ) -> TrainConfig:
     defaults = DEFAULTS[arch]
     epochs = int(args.epochs_mlp if arch == "mlp" else args.epochs_resnet)
-    batch_size = int(args.batch_size_mlp if arch == "mlp" else args.batch_size_resnet)
+    batch_size = int(args.batch_size_mlp if arch == "mlp" else args.batch_size_resnet50 if arch == "resnet50" else args.batch_size_resnet)
     return TrainConfig(
         dataset=dataset_name,
         arch=arch,
@@ -133,9 +141,9 @@ def _template_cfg(
         val_size=int(args.val_size_mlp if arch == "mlp" else args.val_size_resnet),
         mlp_hidden=int(args.mlp_hidden),
         mlp_dropout=float(args.mlp_dropout),
-        resnet_width=int(args.resnet_width),
-        resnet_norm=str(args.resnet_norm),
-        resnet_shortcut=str(args.resnet_shortcut),
+        resnet_width=int(args.resnet_width) if arch != "resnet50" else 1,
+        resnet_norm=str(args.resnet_norm) if arch != "resnet50" else "bn",
+        resnet_shortcut=str(args.resnet_shortcut) if arch != "resnet50" else "C",
         sgd_momentum=float(args.sgd_momentum),
         schedule=defaults["schedule"][optimizer_name],
         cosine_eta_min=float(defaults["cosine_eta_min"][optimizer_name]),
@@ -152,6 +160,10 @@ def _default_hparams_off(arch: str, opt_name: str) -> Tuple[float, float]:
         return 1e-3, 1e-2
     if arch == "mlp":   # sgd
         return 3e-2, 0.0
+    if arch == "resnet50" and opt_name == "adamw":
+        return 3e-4, 5e-3
+    if arch == "resnet50":  # sgd
+        return 1e-1, 5e-4
     if opt_name == "adamw":
         return 3e-4, 5e-3
     # sgd resnet20
@@ -183,7 +195,7 @@ def _run_lmc_pair(
         ckpt_b=ckpt_b,
         out_dir=str(pair_dir),
         data_root=args.data_root,
-        batch_size=int(args.batch_size_resnet if arch == "resnet20" else args.batch_size_mlp),
+        batch_size=int(args.batch_size_resnet50 if arch == "resnet50" else args.batch_size_resnet if arch == "resnet20" else args.batch_size_mlp),
         num_workers=int(args.num_workers),
         eval_samples=int(args.eval_samples),
         num_lambdas=int(args.num_lambdas),
@@ -193,6 +205,7 @@ def _run_lmc_pair(
         shortcut_option=(str(args.resnet_shortcut) if arch == "resnet20" else None),
         norm=(str(args.resnet_norm) if arch == "resnet20" else None),
         silent=bool(args.silent),
+        bn_reset_batches=int(args.bn_reset_batches),
     )
     rerender_named_plots(
         results_path=pair_dir / "interp_results.pt",
@@ -253,7 +266,7 @@ def run_one_experiment(
     )
     test_loader = _make_test_loader(
         setup.test_ds,
-        batch_size=int(args.batch_size_mlp if arch == "mlp" else args.batch_size_resnet),
+        batch_size=int(args.batch_size_mlp if arch == "mlp" else args.batch_size_resnet50 if arch == "resnet50" else args.batch_size_resnet),
         num_workers=int(args.num_workers),
     )
 
@@ -377,6 +390,7 @@ def run_one_experiment(
     # ------------------------------------------------------------------ #
     if not args.skip_lmc:
         width_for_plot = int(args.resnet_width) if arch == "resnet20" else None
+        _ = width_for_plot  # used below
 
         _wandb_lmc_run = None
         if getattr(args, "wandb_project", None):
@@ -450,7 +464,7 @@ def main() -> None:
     )
     p.add_argument("--out-dir",    type=str, default="./SGDvsAdam_out")
     p.add_argument("--data-root",  type=str, default="./data")
-    p.add_argument("--which",      type=str, default="both", choices=["mlp", "resnet20", "both"])
+    p.add_argument("--which",      type=str, default="both", choices=["mlp", "resnet20", "resnet50", "both"])
 
     p.add_argument("--mlp-dataset",    type=str, default=DEFAULTS["mlp"]["dataset"],
                    choices=["MNIST", "FASHIONMNIST", "CIFAR10"])
@@ -461,6 +475,7 @@ def main() -> None:
     p.add_argument("--epochs-resnet",    type=int,   default=DEFAULTS["resnet20"]["epochs"])
     p.add_argument("--batch-size-mlp",   type=int,   default=DEFAULTS["mlp"]["batch_size"])
     p.add_argument("--batch-size-resnet",type=int,   default=DEFAULTS["resnet20"]["batch_size"])
+    p.add_argument("--batch-size-resnet50", type=int, default=DEFAULTS["resnet50"]["batch_size"])
     p.add_argument("--val-size-mlp",     type=int,   default=DEFAULTS["mlp"]["val_size"])
     p.add_argument("--val-size-resnet",  type=int,   default=DEFAULTS["resnet20"]["val_size"])
     p.add_argument("--num-workers",      type=int,   default=4)
@@ -495,6 +510,8 @@ def main() -> None:
     p.add_argument("--num-lambdas",  type=int, default=25)
     p.add_argument("--max-iter",     type=int, default=100)
     p.add_argument("--silent",       action="store_true")
+    p.add_argument("--bn-reset-batches", type=int, default=50,
+                   help="Batches to recalculate BN stats after each interpolation. 0=disabled.")
     args = p.parse_args()
 
     out_root = Path(args.out_dir)
@@ -511,6 +528,13 @@ def main() -> None:
     if args.which in ("resnet20", "both"):
         manifests["resnet20"] = run_one_experiment(
             arch="resnet20",
+            dataset_name=str(args.resnet_dataset),
+            args=args,
+            out_root=out_root,
+        )
+    if args.which == "resnet50":
+        manifests["resnet50"] = run_one_experiment(
+            arch="resnet50",
             dataset_name=str(args.resnet_dataset),
             args=args,
             out_root=out_root,
