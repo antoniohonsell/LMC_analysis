@@ -131,7 +131,7 @@ def main() -> None:
                 "weight_decay": wd,
                 "eps_lin": payload["eps_lin"],
                 "c_lin": payload["c_lin"],
-                "rho_fro": payload["rho_fro"],
+                "cosine_sim_fro": payload["cosine_sim_fro"],
                 "eps_comm": payload["eps_comm"],
                 "pa_mean_cos": payload["principal_angles_topk"]["mean_cos"],
                 "pa_min_cos": payload["principal_angles_topk"]["min_cos"],

@@ -50,7 +50,7 @@ compare_permutations_res/
 compare_permutations_results/
 overall_plots_2/
 crh_results/
-
+SGDvsAdam_out/
 # --- Model checkpoints / large files ---
 *.tar.gz
 *.zip

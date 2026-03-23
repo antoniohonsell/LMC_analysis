@@ -533,6 +533,101 @@ def resnet18(num_classes: int = 10, *, in_channels: int = 3, norm: str = "bn") -
     return ResNet18CIFAR(num_classes=num_classes, in_channels=in_channels, norm=norm, cifar_conv1=True)
 
 
+class ResNet50CIFAR(nn.Module):
+    """
+    ResNet50 with CIFAR-friendly modifications:
+      - conv1: 3×3, stride 1, padding 1 (instead of 7×7 stride 2)
+      - maxpool replaced with Identity
+      - Configurable norm (bn / ln / none)
+    Uses TVBottleneck blocks with [3, 4, 6, 3] layers.
+    Channel widths: 64 → 256 → 512 → 1024 → 2048.
+    """
+
+    def __init__(
+        self,
+        num_classes: int = 10,
+        in_channels: int = 3,
+        norm: str = "bn",
+        zero_init_residual: bool = False,
+    ):
+        super().__init__()
+
+        def norm_layer(c: int) -> nn.Module:
+            return _norm2d(norm, c)
+
+        self._norm_layer = norm_layer
+        self.inplanes = 64
+        self.dilation = 1
+        self.groups = 1
+        self.base_width = 64
+
+        self.conv1 = nn.Conv2d(in_channels, self.inplanes, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn1 = norm_layer(self.inplanes)
+        self.relu = nn.ReLU(inplace=True)
+        self.maxpool = nn.Identity()
+
+        self.layer1 = self._make_layer(TVBottleneck, 64,  3)
+        self.layer2 = self._make_layer(TVBottleneck, 128, 4, stride=2)
+        self.layer3 = self._make_layer(TVBottleneck, 256, 6, stride=2)
+        self.layer4 = self._make_layer(TVBottleneck, 512, 3, stride=2)
+
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc = nn.Linear(512 * TVBottleneck.expansion, num_classes)
+
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
+                if hasattr(m, "weight") and m.weight is not None:
+                    nn.init.constant_(m.weight, 1)
+                if hasattr(m, "bias") and m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+
+        if zero_init_residual:
+            for m in self.modules():
+                if isinstance(m, TVBottleneck):
+                    nn.init.constant_(m.bn3.weight, 0)
+
+    def _make_layer(self, block, planes: int, blocks: int, stride: int = 1) -> nn.Sequential:
+        norm_layer = self._norm_layer
+        downsample = None
+        if stride != 1 or self.inplanes != planes * block.expansion:
+            downsample = nn.Sequential(
+                conv1x1(self.inplanes, planes * block.expansion, stride),
+                norm_layer(planes * block.expansion),
+            )
+
+        layers = []
+        layers.append(block(self.inplanes, planes, stride, downsample,
+                            self.groups, self.base_width, self.dilation, norm_layer))
+        self.inplanes = planes * block.expansion
+        for _ in range(1, blocks):
+            layers.append(block(self.inplanes, planes, groups=self.groups,
+                                base_width=self.base_width, dilation=self.dilation,
+                                norm_layer=norm_layer))
+        return nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
+
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+        x = self.fc(x)
+        return x
+
+
+def resnet50(num_classes: int = 10, *, in_channels: int = 3, norm: str = "bn") -> nn.Module:
+    return ResNet50CIFAR(num_classes=num_classes, in_channels=in_channels, norm=norm)
+
+
 # ---------------------------
 # LightNet family (from resnet18_arch_BatchNorm.py)
 # ---------------------------
@@ -621,6 +716,7 @@ _MODEL_REGISTRY: Dict[str, Callable[..., nn.Module]] = {
     # ResNet18
     "resnet18": resnet18,
     "resnet_18_cifar": resnet18,  # legacy alias
+    "resnet50": resnet50,
     # LightNets
     "lightnet": lightnet,
     "lightnet2": lightnet2,
@@ -672,6 +768,8 @@ def build_model(
         return builder(num_classes=num_classes, in_channels=in_channels, norm=norm, width_multiplier=width_multiplier, **kwargs)
     if builder is resnet18:
         return builder(num_classes=num_classes, in_channels=in_channels, norm=norm, **kwargs)
+    if builder is resnet50:
+        return builder(num_classes=num_classes, in_channels=in_channels, norm=norm, **kwargs)
     if builder is lightnet:
         # LightNet uses input_shape instead of in_channels
         input_shape = kwargs.pop("input_shape", (1, 28, 28))
@@ -694,6 +792,9 @@ __all__ = [
     # ResNet18
     "ResNet18CIFAR",
     "resnet18",
+    # ResNet50
+    "ResNet50CIFAR",
+    "resnet50",
     # LightNets
     "LightNet", "LightNet2",
     "lightnet", "lightnet2",

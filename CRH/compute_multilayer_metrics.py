@@ -376,7 +376,7 @@ def main():
         }
 
         print(f"  ✓ Ha_WTW eps_lin: {metrics.get('eps_lin', 'N/A'):.4f}")
-        print(f"  ✓ Ha_WTW rho_fro: {metrics.get('rho_fro', 'N/A'):.4f}")
+        print(f"  ✓ Ha_WTW cosine_sim_fro: {metrics.get('cosine_sim_fro', 'N/A'):.4f}")
 
     # Save results
     output_path = output_dir / "multilayer_metrics.json"

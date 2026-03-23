@@ -136,6 +136,90 @@ def resnet20_layernorm_permutation_spec(
 
 
 
+def resnet50_permutation_spec(
+    *,
+    state_dict: Optional[Dict[str, torch.Tensor]] = None,
+) -> PermutationSpec:
+    """
+    Permutation spec for ResNet50CIFAR (TVBottleneck, BN).
+
+    Background perms (stage output channels):
+      P_bg0: stem, 64 ch    P_bg1: layer1, 256 ch
+      P_bg2: layer2, 512 ch   P_bg3: layer3, 1024 ch   P_bg4: layer4, 2048 ch
+
+    Per-block inner perms (bottleneck internals):
+      P_layer{l}_{b}_inner1: after conv1+bn1 (reduction)
+      P_layer{l}_{b}_inner2: after conv2+bn2 (spatial)
+
+    Block counts are inferred from state_dict when provided.
+    """
+    import re as _re
+
+    def bn_wb(base: str, p: str) -> Dict[str, Tuple[Optional[str], ...]]:
+        d: Dict[str, Tuple[Optional[str], ...]] = {}
+        for suffix in ("weight", "bias", "running_mean", "running_var"):
+            key = f"{base}.{suffix}"
+            if state_dict is None or key in state_dict:
+                d[key] = (p,)
+        return d
+
+    axes: Dict[str, Tuple[Optional[str], ...]] = {}
+
+    # Stem
+    axes["conv1.weight"] = ("P_bg0", None, None, None)
+    axes.update(bn_wb("bn1", "P_bg0"))
+
+    # layer → (default_n_blocks, p_in, p_out)
+    layer_cfgs = [
+        (1, 3, "P_bg0", "P_bg1"),
+        (2, 4, "P_bg1", "P_bg2"),
+        (3, 6, "P_bg2", "P_bg3"),
+        (4, 3, "P_bg3", "P_bg4"),
+    ]
+
+    for layer_idx, default_n_blocks, p_in_stage, p_out_stage in layer_cfgs:
+        # Infer actual block count from checkpoint.
+        n_blocks = default_n_blocks
+        if state_dict is not None:
+            found = {int(m.group(1))
+                     for k in state_dict
+                     for m in [_re.match(rf"layer{layer_idx}\.(\d+)\.", k)] if m}
+            if found:
+                n_blocks = max(found) + 1
+
+        for b in range(n_blocks):
+            prefix = f"layer{layer_idx}.{b}"
+            inner1 = f"P_layer{layer_idx}_{b}_inner1"
+            inner2 = f"P_layer{layer_idx}_{b}_inner2"
+            p_in  = p_in_stage if b == 0 else p_out_stage
+            p_out = p_out_stage
+
+            # Bottleneck: conv1 (1×1) → conv2 (3×3) → conv3 (1×1)
+            axes[f"{prefix}.conv1.weight"] = (inner1, p_in,  None, None)
+            axes.update(bn_wb(f"{prefix}.bn1", inner1))
+            axes[f"{prefix}.conv2.weight"] = (inner2, inner1, None, None)
+            axes.update(bn_wb(f"{prefix}.bn2", inner2))
+            axes[f"{prefix}.conv3.weight"] = (p_out,  inner2, None, None)
+            axes.update(bn_wb(f"{prefix}.bn3", p_out))
+
+            # Downsample (present when in/out channels differ — always block 0).
+            ds_conv = f"{prefix}.downsample.0.weight"
+            ds_bn   = f"{prefix}.downsample.1"
+            if state_dict is None or ds_conv in state_dict:
+                axes[ds_conv] = (p_out, p_in, None, None)
+                axes.update(bn_wb(ds_bn, p_out))
+
+    # Classifier
+    axes["fc.weight"] = (None, "P_bg4")
+    axes["fc.bias"]   = (None,)
+
+    # Prune to keys that exist in the checkpoint.
+    if state_dict is not None:
+        axes = {k: v for k, v in axes.items() if k in state_dict}
+
+    return permutation_spec_from_axes_to_perm(axes)
+
+
 def _index_select(x: torch.Tensor, dim: int, index: torch.Tensor) -> torch.Tensor:
     # index must be 1D long on same device
     return torch.index_select(x, dim, index)

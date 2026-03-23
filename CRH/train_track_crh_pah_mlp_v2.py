@@ -543,7 +543,7 @@ def flatten_pair(prefix: str, m: Dict[str, Any]) -> Dict[str, Any]:
     return {
         f"{prefix}_eps_lin": m["eps_lin"],
         f"{prefix}_c_lin": m["c_lin"],
-        f"{prefix}_rho_fro": m["rho_fro"],
+        f"{prefix}_cosine_sim_fro": m["cosine_sim_fro"],
         f"{prefix}_pearson_correlation": m["pearson_correlation"],
         f"{prefix}_eps_comm": m["eps_comm"],
         f"{prefix}_pa_mean_cos": pa["mean_cos"],
@@ -554,7 +554,7 @@ def flatten_pair(prefix: str, m: Dict[str, Any]) -> Dict[str, Any]:
         f"{prefix}_pow_eps": pw["eps_pow"],
         f"{prefix}_pow_alpha": pw["alpha"],
         f"{prefix}_pow_c": pw["c"],
-        f"{prefix}_pow_rho_fro": pw.get("rho_pow_fro", float("nan")),
+        f"{prefix}_pow_cosine_sim_fro": pw.get("rho_pow_fro", float("nan")),
     }
 
 
