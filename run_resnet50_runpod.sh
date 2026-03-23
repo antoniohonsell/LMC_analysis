@@ -3,7 +3,6 @@ set -e
 
 cd "$(dirname "$0")"
 
-source /path/to/your/venv/bin/activate  # adjust to your venv path
 
 python SGDvsAdam/run_sgd_vs_adam.py \
   --which resnet50 \
