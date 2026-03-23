@@ -27,7 +27,7 @@ python SGDvsAdam/run_sgd_vs_adam.py \
   --tuning-seed 99 \
   --save-every 200 \
   --num-workers 4 \
-  --resnet-width 8 \
+  --resnet-width 4 \
   --batch-size-resnet 128 \
   --tune-mode quick \
   --wandb-project "bachelor-thesis"
