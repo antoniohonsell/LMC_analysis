@@ -292,7 +292,7 @@ def run_one_experiment(
     # Use the full train+val for final training; keep tune split separate.
     full_indices = setup.train_indices + setup.val_indices
     train_full_ds = Subset(setup.train_full, full_indices)
-    monitor_ds    = Subset(setup.eval_full,  full_indices)
+    monitor_ds    = setup.test_ds  # test set is the only true held-out data here
 
     # ------------------------------------------------------------------ #
     # Phase 1 — Hyperparameter tuning (single tuning seed per optimizer) #
