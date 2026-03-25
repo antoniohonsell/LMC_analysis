@@ -565,6 +565,18 @@ def train_run(
         if test_loader is not None and "best" in metrics and metrics["best"]:
             _wandb_run.summary["test/best_accuracy"] = metrics["best"]["accuracy"]
             _wandb_run.summary["test/best_loss"] = metrics["best"]["loss"]
+        try:
+            import wandb  # type: ignore
+            artifact = wandb.Artifact(name=run_name, type="model")
+            best_path = run_dir / f"{run_name}_best.pth"
+            final_path = run_dir / f"{run_name}_final.pth"
+            if best_path.exists():
+                artifact.add_file(str(best_path), name="best.pth")
+            if final_path.exists():
+                artifact.add_file(str(final_path), name="final.pth")
+            _wandb_run.log_artifact(artifact)
+        except Exception as e:
+            print(f"[wandb] Failed to upload checkpoint artifact: {e}")
         _wandb_run.finish()
 
     del model
