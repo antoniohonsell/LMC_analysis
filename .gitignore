@@ -40,6 +40,10 @@ activation_stitching_out*
 activation_stitching_out_*/
 weight_matching_out_fashionmnist_mlp/
 activation_stitching_out_fashionmnist_mlp/
+activation_mlp_high_wd/
+CRH/controlled_exp/results*/
+
+
 # need to handle better the git ignore !!!
 out/
 overall_plots/
