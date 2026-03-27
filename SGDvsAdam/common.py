@@ -608,6 +608,7 @@ def tune_grid(
             cfg = TrainConfig(**asdict(template_cfg))
             cfg.lr = float(lr)
             cfg.weight_decay = float(wd)
+            cfg.save_every = cfg.epochs  # no intermediate checkpoints during tuning
             trial_tag = f"lr{lr:.6g}_wd{wd:.6g}".replace("-", "m")
             trial_dir = out_dir / trial_tag
             trial_name = f"{run_prefix}_{trial_tag}"

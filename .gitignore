@@ -42,6 +42,8 @@ weight_matching_out_fashionmnist_mlp/
 activation_stitching_out_fashionmnist_mlp/
 activation_mlp_high_wd/
 CRH/controlled_exp/results*/
+wm_mlp_high_wd/
+fully_connected_example.ipynb
 
 
 # need to handle better the git ignore !!!

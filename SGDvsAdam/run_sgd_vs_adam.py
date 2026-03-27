@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import sys
 from itertools import combinations
 from pathlib import Path
@@ -332,6 +333,10 @@ def run_one_experiment(
                 wd_grid=grid["wd"],
                 run_prefix=f"{arch}_{dataset_name}_{opt_name}_tune",
             )
+            # remove trial checkpoint dirs — only the summary JSON is needed
+            for trial_dir in (tuning_dir / opt_name).iterdir():
+                if trial_dir.is_dir():
+                    shutil.rmtree(trial_dir)
 
         best_hparams[opt_name] = {
             "lr": float(tuning_summary["best_lr"]),
