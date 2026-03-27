@@ -307,6 +307,7 @@ class TrainConfig:
     warmup_lr_start: float = 1e-6
     save_every: int = 10
     save_last: bool = True
+    early_stopping_patience: int = 0  # 0 = disabled
 
 
 @dataclass
@@ -535,6 +536,7 @@ def train_run(
         save_last=bool(cfg.save_last),
         resume_from=resume_ckpt,
         wandb_run=_wandb_run,
+        early_stopping_patience=int(cfg.early_stopping_patience),
     )
     t1 = time.time()
 

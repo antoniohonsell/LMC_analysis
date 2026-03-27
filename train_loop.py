@@ -62,6 +62,7 @@ def train(
     save_last=True,
     resume_from=None,
     wandb_run=None,
+    early_stopping_patience=0,
 ):
     if save_dir is not None:
         os.makedirs(save_dir, exist_ok=True)
@@ -78,6 +79,8 @@ def train(
     train_size = len(train_loader.dataset)
 
     best_val_loss = float("inf")
+    early_stopping_patience = int(early_stopping_patience)
+    no_improve_epochs = 0
     start_epoch = 1
 
     if resume_from is not None and os.path.isfile(resume_from):
@@ -125,8 +128,13 @@ def train(
         val_loss, val_acc = validate(model, criterion, val_loader, device)
 
         # Save best checkpoint (by validation loss)
-        if save_dir is not None and val_loss < best_val_loss:
+        if val_loss < best_val_loss:
             best_val_loss = val_loss
+            no_improve_epochs = 0
+        else:
+            no_improve_epochs += 1
+
+        if save_dir is not None and val_loss == best_val_loss:
             path = os.path.join(save_dir, f"{run_name}_best.pth")
             torch.save(
                 {
@@ -161,6 +169,11 @@ def train(
                 },
                 step=epoch,
             )
+
+        # early stopping
+        if early_stopping_patience > 0 and no_improve_epochs >= early_stopping_patience:
+            print(f"[early stopping] No val_loss improvement for {early_stopping_patience} epochs — stopping at epoch {epoch}.")
+            break
 
         # periodic checkpoint
         if save_dir is not None and (epoch % save_every == 0):
