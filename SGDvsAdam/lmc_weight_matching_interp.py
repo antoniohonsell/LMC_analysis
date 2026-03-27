@@ -315,6 +315,24 @@ def plot_interp_acc(title: str, lambdas: Sequence[float], train_naive, test_naiv
     return fig
 
 
+def _clean_ckpt_label(ckpt_path: str) -> str:
+    """
+    Extract a short human-readable label from a checkpoint path.
+    E.g. 'mlp_FASHIONMNIST_muon_seed0_final.pth' → 'Muon s0'
+         'resnet20_CIFAR10_sgd_seed2_final.pth'   → 'SGD s2'
+    Falls back to the bare filename stem if parsing fails.
+    """
+    stem = Path(ckpt_path).stem  # e.g. 'mlp_FASHIONMNIST_muon_seed0_final'
+    stem = stem.replace("_final", "").replace("_best", "")
+    # Try to find 'seed<N>' and the token before it (optimizer name)
+    import re
+    m = re.search(r"_([\w]+)_seed(\d+)$", stem)
+    if m:
+        opt = m.group(1).upper().replace("ADAMW", "AdamW").replace("SGD", "SGD").replace("ADAM", "Adam").replace("MUON", "Muon")
+        return f"{opt} s{m.group(2)}"
+    return stem
+
+
 def run_weight_matching_interp(
     *,
     arch: str,
@@ -334,6 +352,7 @@ def run_weight_matching_interp(
     norm: Optional[str] = None,
     silent: bool = False,
     bn_reset_batches: int = 50,
+    plot_title: Optional[str] = None,
 ) -> Dict[str, Any]:
     arch_l = arch.strip().lower()
     os.makedirs(out_dir, exist_ok=True)
@@ -458,7 +477,14 @@ def run_weight_matching_interp(
         test_loss_perm.append(vl)
         test_acc_perm.append(va)
 
-    title = f"{dataset_name} {arch.upper()}: {Path(ckpt_a).name} vs {Path(ckpt_b).name}"
+    if plot_title is not None:
+        title = plot_title
+    else:
+        dataset_pretty = dataset_name.replace("FASHIONMNIST", "FashionMNIST").replace("CIFAR10", "CIFAR-10").replace("CIFAR100", "CIFAR-100")
+        arch_pretty = arch.upper().replace("RESNET20", "ResNet-20").replace("RESNET50", "ResNet-50")
+        label_a = _clean_ckpt_label(ckpt_a)
+        label_b = _clean_ckpt_label(ckpt_b)
+        title = f"{dataset_pretty} — {arch_pretty}: {label_a} vs {label_b}"
     fig = plot_interp_loss(title, lambdas, train_loss_naive, test_loss_naive, train_loss_perm, test_loss_perm)
     loss_path = os.path.join(out_dir, "interp_loss.png")
     fig.savefig(loss_path, dpi=300)
