@@ -87,6 +87,7 @@ class Muon(torch.optim.Optimizer):
         nesterov: bool = True,
         ns_steps: int = 5,
         weight_decay: float = 0.0,
+        grad_clip: float = 1.0,
     ):
         defaults = dict(
             lr=lr,
@@ -94,6 +95,7 @@ class Muon(torch.optim.Optimizer):
             nesterov=nesterov,
             ns_steps=ns_steps,
             weight_decay=weight_decay,
+            grad_clip=grad_clip,
         )
         super().__init__(params, defaults)
 
@@ -111,11 +113,23 @@ class Muon(torch.optim.Optimizer):
             ns_steps     = int(group["ns_steps"])
             weight_decay = float(group["weight_decay"])
 
+            grad_clip = float(group["grad_clip"])
+
             for p in group["params"]:
                 if p.grad is None:
                     continue
 
                 g = p.grad.clone()
+
+                # Skip NaN/Inf gradients
+                if not torch.isfinite(g).all():
+                    continue
+
+                # Gradient clipping per-parameter
+                if grad_clip > 0.0:
+                    g_norm = g.norm()
+                    if g_norm > grad_clip:
+                        g = g * (grad_clip / g_norm)
 
                 # Optional weight decay (applied as L2 before momentum)
                 if weight_decay != 0.0:

@@ -719,15 +719,15 @@ def default_hparam_grid(arch: str, optimizer_name: str, mode: str = "quick") -> 
         return {"lr": [1e-4, 3e-4, 1e-3, 3e-3], "wd": [1e-4, 1e-3, 5e-3, 1e-2]}
 
     if optimizer_name == "muon":
-        # Muon: lr is the main knob; weight_decay is typically 0
+        # Muon: orthogonalized updates — lr must be small relative to SGD
         if arch == "mlp":
             if mode == "quick":
-                return {"lr": [5e-3, 1e-2, 2e-2], "wd": [0.0]}
-            return {"lr": [2e-3, 5e-3, 1e-2, 2e-2, 5e-2], "wd": [0.0]}
+                return {"lr": [1e-3, 3e-3, 5e-3], "wd": [0.0]}
+            return {"lr": [5e-4, 1e-3, 2e-3, 3e-3, 5e-3], "wd": [0.0]}
         if arch == "resnet20":
             if mode == "quick":
-                return {"lr": [5e-3, 1e-2, 2e-2], "wd": [0.0]}
-            return {"lr": [2e-3, 5e-3, 1e-2, 2e-2, 5e-2], "wd": [0.0]}
+                return {"lr": [1e-3, 3e-3, 5e-3], "wd": [0.0]}
+            return {"lr": [5e-4, 1e-3, 2e-3, 3e-3, 5e-3], "wd": [0.0]}
 
     raise ValueError(f"No default grid for arch={arch}, optimizer={optimizer_name}")
 
