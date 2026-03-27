@@ -189,6 +189,11 @@ def _run_lmc_pair(
         print(f"[skip] LMC '{pair_tag}' already computed.")
         return {"results_pt": str(pair_dir / "interp_results.pt"), "skipped": True}
 
+    dataset_pretty = dataset_name.replace("FASHIONMNIST", "FashionMNIST").replace("CIFAR10", "CIFAR-10").replace("CIFAR100", "CIFAR-100")
+    arch_pretty = {"mlp": "MLP", "resnet20": "ResNet-20", "resnet50": "ResNet-50"}.get(arch.lower(), arch.upper())
+    clean_tag = pair_tag.replace("_vs_", " vs ").replace("_seed", " s").replace("sgd", "SGD").replace("adamw", "AdamW").replace("muon", "Muon")
+    plot_title = f"{dataset_pretty} — {arch_pretty}: {clean_tag}"
+
     results = run_weight_matching_interp(
         arch=arch,
         dataset_name=dataset_name,
@@ -207,6 +212,7 @@ def _run_lmc_pair(
         norm=(str(args.resnet_norm) if arch == "resnet20" else None),
         silent=bool(args.silent),
         bn_reset_batches=int(args.bn_reset_batches),
+        plot_title=plot_title,
     )
     rerender_named_plots(
         results_path=pair_dir / "interp_results.pt",

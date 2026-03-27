@@ -1,32 +1,19 @@
 #!/usr/bin/env python3
 """
-run_muon_lmc.py
+run_muon_resnet_lmc.py
 
-Trains MLP on FashionMNIST with the Muon optimizer, tunes hyperparameters,
-then checks Linear Mode Connectivity (LMC) against:
+Trains ResNet-20 (LayerNorm, width=16) on CIFAR-10 with the Muon optimizer,
+tunes hyperparameters, then checks Linear Mode Connectivity (LMC) against:
   - Other Muon seeds        (same-optimizer pairs)
   - SGD checkpoints         (cross-optimizer, loaded from --sgd-adam-out-dir)
   - AdamW checkpoints       (cross-optimizer, loaded from --sgd-adam-out-dir)
 
-Phases:
-  1. Tune Muon lr           (quick grid: 3 lrs × 1 wd = 3 trials)
-  2. Train N Muon seeds     with best hparams
-  3. LMC:
-       Muon  vs Muon  (all C(n,2) pairs)
-       Muon  vs SGD   (all n×n pairs)   — only if --sgd-adam-out-dir is given
-       Muon  vs AdamW (all n×n pairs)   — only if --sgd-adam-out-dir is given
-
 Usage:
-  # Muon-only:
-  python SGDvsAdam/run_muon_lmc.py --out-dir ./muon_out
+  # Muon only:
+  PYTHONPATH=~/LMC_analysis nohup python SGDvsAdam/run_muon_resnet_lmc.py --out-dir ./muon_resnet_out > muon_resnet.log 2>&1 &
 
-  # With cross-optimizer comparison (point at existing SGD/AdamW results):
-  python SGDvsAdam/run_muon_lmc.py --out-dir ./muon_out \\
-      --sgd-adam-out-dir ./SGDvsAdam_out
-
-  nohup version:
-  PYTHONPATH=/workspace/LMC_analysis nohup python SGDvsAdam/run_muon_lmc.py \\
-      --out-dir ./muon_out --sgd-adam-out-dir ./SGDvsAdam_out > muon.log 2>&1 &
+  # With cross-optimizer comparison:
+  PYTHONPATH=~/LMC_analysis nohup python SGDvsAdam/run_muon_resnet_lmc.py --out-dir ./muon_resnet_out --sgd-adam-out-dir ./SGDvsAdam_out > muon_resnet.log 2>&1 &
 """
 from __future__ import annotations
 
@@ -36,7 +23,7 @@ import shutil
 import sys
 from itertools import combinations
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from torch.utils.data import DataLoader, Subset
 
@@ -61,22 +48,25 @@ from lmc_weight_matching_interp import run_weight_matching_interp  # type: ignor
 from plot_interp_local import load_interp_results, plot_acc, plot_loss  # type: ignore
 
 
-ARCH         = "mlp"
-DATASET      = "FASHIONMNIST"
-OPTIMIZER    = "muon"
+ARCH      = "resnet20"
+DATASET   = "CIFAR10"
+OPTIMIZER = "muon"
 
 DEFAULTS = {
-    "epochs":     50,   # higher ceiling — early stopping will cut it short
-    "batch_size": 256,
-    "val_size":   5000,
-    "schedule":   "cosine",
+    "epochs":       200,
+    "batch_size":   256,
+    "val_size":     5000,
+    "schedule":     "cosine",
     "cosine_eta_min": 1e-5,
-    "early_stopping_patience": 7,
+    "early_stopping_patience": 15,   # patience is longer for ResNet
+    "resnet_width":    16,
+    "resnet_norm":     "flax_ln",
+    "resnet_shortcut": "C",
 }
 
 
 # ---------------------------------------------------------------------------
-# Helpers (mirrors run_sgd_vs_adam.py)
+# Helpers
 # ---------------------------------------------------------------------------
 
 def _make_test_loader(test_ds, batch_size: int, num_workers: int) -> DataLoader:
@@ -90,11 +80,11 @@ def _make_test_loader(test_ds, batch_size: int, num_workers: int) -> DataLoader:
     )
 
 
-def rerender_named_plots(results_path, out_dir, dataset, arch, tag):
+def rerender_named_plots(results_path, out_dir, tag):
     res = load_interp_results(str(results_path))
     out_dir.mkdir(parents=True, exist_ok=True)
-    base = f"{dataset.lower()}_{arch.lower()}_{tag}"
-    title = f"{dataset} {arch} — {tag}"
+    base  = f"cifar10_resnet20_{tag}"
+    title = f"CIFAR-10 — ResNet-20: {tag}"
     plot_loss(
         res["lambdas"],
         res["train_loss_naive"], res["test_loss_naive"],
@@ -118,16 +108,17 @@ def _template_cfg(args: argparse.Namespace) -> TrainConfig:
         dataset=DATASET,
         arch=ARCH,
         optimizer_name=OPTIMIZER,
-        lr=0.0,           # overridden after tuning
+        lr=0.0,
         weight_decay=0.0,
         epochs=int(args.epochs),
         batch_size=int(args.batch_size),
         num_workers=int(args.num_workers),
-        model_seed=0,     # overridden per seed
+        model_seed=0,
         split_seed=int(args.split_seed),
         val_size=int(args.val_size),
-        mlp_hidden=int(args.mlp_hidden),
-        mlp_dropout=float(args.mlp_dropout),
+        resnet_width=int(args.resnet_width),
+        resnet_norm=str(args.resnet_norm),
+        resnet_shortcut=str(args.resnet_shortcut),
         muon_momentum=float(args.muon_momentum),
         muon_ns_steps=int(args.muon_ns_steps),
         schedule=DEFAULTS["schedule"],
@@ -138,22 +129,13 @@ def _template_cfg(args: argparse.Namespace) -> TrainConfig:
     )
 
 
-def _run_lmc_pair(
-    *,
-    ckpt_a: str,
-    ckpt_b: str,
-    pair_dir: Path,
-    figs_dir: Path,
-    pair_tag: str,
-    args: argparse.Namespace,
-    wandb_lmc_run=None,
-) -> Dict[str, Any]:
+def _run_lmc_pair(*, ckpt_a, ckpt_b, pair_dir, figs_dir, pair_tag, args, wandb_lmc_run=None):
     if (pair_dir / "interp_results.pt").exists():
         print(f"[skip] LMC '{pair_tag}' already computed.")
         return {"results_pt": str(pair_dir / "interp_results.pt"), "skipped": True}
 
     clean_tag = pair_tag.replace("_vs_", " vs ").replace("_seed", " s").replace("sgd", "SGD").replace("adamw", "AdamW").replace("muon", "Muon")
-    plot_title = f"FashionMNIST — MLP: {clean_tag}"
+    plot_title = f"CIFAR-10 — ResNet-20: {clean_tag}"
 
     results = run_weight_matching_interp(
         arch=ARCH,
@@ -168,25 +150,21 @@ def _run_lmc_pair(
         num_lambdas=int(args.num_lambdas),
         seed=int(args.split_seed),
         max_iter=int(args.max_iter),
+        width_multiplier=int(args.resnet_width),
+        shortcut_option=str(args.resnet_shortcut),
+        norm=str(args.resnet_norm),
         silent=bool(args.silent),
-        bn_reset_batches=0,  # MLP has no BN
+        bn_reset_batches=0,   # LayerNorm — no BN recalibration needed
         plot_title=plot_title,
     )
-    rerender_named_plots(
-        results_path=pair_dir / "interp_results.pt",
-        out_dir=figs_dir,
-        dataset=DATASET,
-        arch=ARCH,
-        tag=pair_tag,
-    )
+    rerender_named_plots(pair_dir / "interp_results.pt", figs_dir, clean_tag)
 
     if wandb_lmc_run is not None:
         try:
             import wandb  # type: ignore
             log_dict: Dict[str, Any] = {}
-            for kind, key in [("loss_interp", f"lmc/{pair_tag}/loss"),
-                               ("acc_interp",  f"lmc/{pair_tag}/acc")]:
-                png = figs_dir / f"{DATASET.lower()}_{ARCH}_{pair_tag}_{kind}.png"
+            for kind, key in [("loss_interp", f"lmc/{pair_tag}/loss"), ("acc_interp", f"lmc/{pair_tag}/acc")]:
+                png = figs_dir / f"cifar10_resnet20_{clean_tag}_{kind}.png"
                 if png.exists():
                     log_dict[key] = wandb.Image(str(png))
             if log_dict:
@@ -204,34 +182,19 @@ def _run_lmc_pair(
     }
 
 
-# ---------------------------------------------------------------------------
-# Load existing SGD / AdamW checkpoint paths from a previous run
-# ---------------------------------------------------------------------------
-
-def _load_existing_ckpts(
-    sgd_adam_out_dir: Path,
-    seeds: List[int],
-) -> Dict[str, Dict[int, str]]:
-    """
-    Returns {opt_name: {seed: ckpt_path}} for sgd and adamw,
-    reading the manifest from a previous run_sgd_vs_adam.py run.
-    Silently skips missing checkpoints.
-    """
+def _load_existing_ckpts(sgd_adam_out_dir: Path, seeds: List[int]) -> Dict[str, Dict[int, str]]:
     manifest_path = sgd_adam_out_dir / f"{ARCH}_{DATASET.lower()}" / "manifest.json"
     if not manifest_path.exists():
-        print(f"[warn] No manifest found at {manifest_path} — skipping cross-optimizer LMC.")
+        print(f"[warn] No manifest at {manifest_path} — skipping cross-optimizer LMC.")
         return {}
-
     with manifest_path.open() as f:
         manifest = json.load(f)
-
     result: Dict[str, Dict[int, str]] = {}
     for opt_name in ("sgd", "adamw"):
         result[opt_name] = {}
         for seed in seeds:
-            key = f"seed_{seed}"
             try:
-                ckpt = manifest["final"][opt_name][key]["ckpt"]
+                ckpt = manifest["final"][opt_name][f"seed_{seed}"]["ckpt"]
                 if Path(ckpt).exists():
                     result[opt_name][seed] = ckpt
                 else:
@@ -245,11 +208,11 @@ def _load_existing_ckpts(
 # Main experiment
 # ---------------------------------------------------------------------------
 
-def run_muon_experiment(args: argparse.Namespace) -> Dict[str, Any]:
+def run_muon_resnet_experiment(args: argparse.Namespace) -> Dict[str, Any]:
     seeds: List[int] = [int(s.strip()) for s in str(args.seeds).split(",") if s.strip()]
 
-    out_root  = Path(args.out_dir)
-    exp_dir   = out_root / f"{ARCH}_{DATASET.lower()}"
+    out_root   = Path(args.out_dir)
+    exp_dir    = out_root / f"{ARCH}_{DATASET.lower()}"
     tuning_dir = exp_dir / "tuning"
     final_dir  = exp_dir / "final"
     lmc_dir    = exp_dir / "lmc"
@@ -262,15 +225,15 @@ def run_muon_experiment(args: argparse.Namespace) -> Dict[str, Any]:
         split_seed=int(args.split_seed),
         val_size=int(args.val_size),
     )
-    test_loader = _make_test_loader(
-        setup.test_ds, batch_size=int(args.batch_size), num_workers=int(args.num_workers)
-    )
+    test_loader    = _make_test_loader(setup.test_ds, int(args.batch_size), int(args.num_workers))
     full_indices   = setup.train_indices + setup.val_indices
     train_full_ds  = Subset(setup.train_full, full_indices)
 
     manifest: Dict[str, Any] = {
         "arch": ARCH, "dataset": DATASET, "seeds": seeds,
         "optimizer": OPTIMIZER,
+        "resnet_width": int(args.resnet_width),
+        "resnet_norm":  str(args.resnet_norm),
         "tuning": {},
         "final": {},
         "lmc": {"muon_vs_muon": {}, "muon_vs_sgd": {}, "muon_vs_adamw": {}},
@@ -291,7 +254,7 @@ def run_muon_experiment(args: argparse.Namespace) -> Dict[str, Any]:
         save_json(tuning_summary_path, tuning_summary)
 
     elif tuning_summary_path.exists():
-        print(f"[skip] Tuning for {OPTIMIZER} already done — loading saved summary.")
+        print(f"[skip] Tuning for {OPTIMIZER} already done.")
         with tuning_summary_path.open() as f:
             tuning_summary = json.load(f)
 
@@ -307,7 +270,6 @@ def run_muon_experiment(args: argparse.Namespace) -> Dict[str, Any]:
             wd_grid=grid["wd"],
             run_prefix=f"{ARCH}_{DATASET}_{OPTIMIZER}_tune",
         )
-        # clean up trial dirs — only keep the summary JSON
         for trial_dir in (tuning_dir / OPTIMIZER).iterdir():
             if trial_dir.is_dir():
                 shutil.rmtree(trial_dir)
@@ -374,21 +336,17 @@ def run_muon_experiment(args: argparse.Namespace) -> Dict[str, Any]:
         except ImportError:
             pass
 
-    # --- Muon vs Muon ---
+    # Muon vs Muon
     for s1, s2 in combinations(seeds, 2):
         pair_tag = f"muon_seed{s1}_vs_seed{s2}"
         pair_dir = lmc_dir / "muon_vs_muon" / f"seed{s1}_vs_seed{s2}"
         manifest["lmc"]["muon_vs_muon"][f"seed{s1}_vs_seed{s2}"] = _run_lmc_pair(
-            ckpt_a=muon_ckpts[s1],
-            ckpt_b=muon_ckpts[s2],
-            pair_dir=pair_dir,
-            figs_dir=figs_dir,
-            pair_tag=pair_tag,
-            args=args,
-            wandb_lmc_run=_wandb_lmc_run,
+            ckpt_a=muon_ckpts[s1], ckpt_b=muon_ckpts[s2],
+            pair_dir=pair_dir, figs_dir=figs_dir, pair_tag=pair_tag,
+            args=args, wandb_lmc_run=_wandb_lmc_run,
         )
 
-    # --- Cross-optimizer: Muon vs SGD / AdamW ---
+    # Cross-optimizer: Muon vs SGD / AdamW
     existing: Dict[str, Dict[int, str]] = {}
     if args.sgd_adam_out_dir is not None:
         existing = _load_existing_ckpts(Path(args.sgd_adam_out_dir), seeds)
@@ -396,20 +354,16 @@ def run_muon_experiment(args: argparse.Namespace) -> Dict[str, Any]:
     for other_opt in ("sgd", "adamw"):
         lmc_key = f"muon_vs_{other_opt}"
         if not existing.get(other_opt):
-            print(f"[skip] No {other_opt} checkpoints found — skipping {lmc_key}.")
+            print(f"[skip] No {other_opt} checkpoints — skipping {lmc_key}.")
             continue
         for s_muon in seeds:
             for s_other, other_ckpt in existing[other_opt].items():
                 pair_tag = f"muon_seed{s_muon}_vs_{other_opt}_seed{s_other}"
                 pair_dir = lmc_dir / lmc_key / f"muon_seed{s_muon}_vs_{other_opt}_seed{s_other}"
                 manifest["lmc"][lmc_key][pair_tag] = _run_lmc_pair(
-                    ckpt_a=muon_ckpts[s_muon],
-                    ckpt_b=other_ckpt,
-                    pair_dir=pair_dir,
-                    figs_dir=figs_dir,
-                    pair_tag=pair_tag,
-                    args=args,
-                    wandb_lmc_run=_wandb_lmc_run,
+                    ckpt_a=muon_ckpts[s_muon], ckpt_b=other_ckpt,
+                    pair_dir=pair_dir, figs_dir=figs_dir, pair_tag=pair_tag,
+                    args=args, wandb_lmc_run=_wandb_lmc_run,
                 )
 
     if _wandb_lmc_run is not None:
@@ -425,37 +379,31 @@ def run_muon_experiment(args: argparse.Namespace) -> Dict[str, Any]:
 
 def main() -> None:
     p = argparse.ArgumentParser(
-        description=(
-            "Muon LMC experiment:\n"
-            "  1. Tune Muon lr on MLP/FashionMNIST.\n"
-            "  2. Train N seeds with best hparams.\n"
-            "  3. Compute LMC: Muon-Muon and optionally Muon-SGD / Muon-AdamW."
-        )
+        description="Muon ResNet-20/CIFAR-10 LMC experiment."
     )
-    p.add_argument("--out-dir",          type=str, default="./muon_out")
+    p.add_argument("--out-dir",          type=str, default="./muon_resnet_out")
     p.add_argument("--data-root",        type=str, default="./data")
-    p.add_argument("--sgd-adam-out-dir", type=str, default=None,
-                   help="Path to SGDvsAdam_out directory containing SGD/AdamW checkpoints. "
-                        "If given, cross-optimizer LMC (Muon vs SGD/AdamW) is computed.")
+    p.add_argument("--sgd-adam-out-dir", type=str, default=None)
 
-    p.add_argument("--epochs",     type=int,   default=DEFAULTS["epochs"], help="Max epochs (early stopping may cut it short).")
+    p.add_argument("--epochs",     type=int,   default=DEFAULTS["epochs"])
     p.add_argument("--batch-size", type=int,   default=DEFAULTS["batch_size"])
     p.add_argument("--val-size",   type=int,   default=DEFAULTS["val_size"])
     p.add_argument("--num-workers",type=int,   default=4)
 
-    p.add_argument("--seeds",       type=str, default="0,1,2",
-                   help="Comma-separated model seeds.")
+    p.add_argument("--seeds",       type=str, default="0,1,2")
     p.add_argument("--tuning-seed", type=int, default=99)
     p.add_argument("--split-seed",  type=int, default=50)
     p.add_argument("--save-every",  type=int, default=10)
 
-    p.add_argument("--mlp-hidden",  type=int,   default=512)
-    p.add_argument("--mlp-dropout", type=float, default=0.0)
+    p.add_argument("--resnet-width",    type=int, default=DEFAULTS["resnet_width"])
+    p.add_argument("--resnet-norm",     type=str, default=DEFAULTS["resnet_norm"],
+                   choices=["bn", "ln", "flax_ln", "none"])
+    p.add_argument("--resnet-shortcut", type=str, default=DEFAULTS["resnet_shortcut"],
+                   choices=["A", "B", "C"])
 
-    p.add_argument("--muon-momentum", type=float, default=0.95)
-    p.add_argument("--muon-ns-steps", type=int,   default=5)
-    p.add_argument("--muon-lr-default", type=float, default=0.02,
-                   help="Default Muon lr used when --tune-mode off.")
+    p.add_argument("--muon-momentum",   type=float, default=0.95)
+    p.add_argument("--muon-ns-steps",   type=int,   default=5)
+    p.add_argument("--muon-lr-default", type=float, default=0.003)
 
     p.add_argument("--tune-mode", type=str, default="quick", choices=["off", "quick", "full"])
     p.add_argument("--skip-lmc",  action="store_true")
@@ -469,7 +417,7 @@ def main() -> None:
 
     args = p.parse_args()
 
-    manifest = run_muon_experiment(args)
+    manifest = run_muon_resnet_experiment(args)
     print(json.dumps(manifest, indent=2, default=str))
 
 

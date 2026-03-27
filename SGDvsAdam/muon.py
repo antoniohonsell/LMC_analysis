@@ -145,9 +145,13 @@ class Muon(torch.optim.Optimizer):
                 # Nesterov lookahead
                 update = g.add(buf, alpha=momentum) if nesterov else buf.clone()
 
-                # Orthogonalize 2-D weight matrices via Newton-Schulz
-                if update.ndim == 2:
-                    update = _zeropower_via_newtonschulz(update, steps=ns_steps)
+                # Orthogonalize weight matrices (2-D) and conv kernels (4-D)
+                # Conv: reshape (out, in, h, w) → (out, in*h*w), orthogonalize, reshape back
+                if update.ndim >= 2:
+                    orig_shape = update.shape
+                    update = _zeropower_via_newtonschulz(
+                        update.reshape(orig_shape[0], -1), steps=ns_steps
+                    ).reshape(orig_shape)
 
                 p.add_(update, alpha=-lr)
 
@@ -179,7 +183,9 @@ def build_muon(
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
-        if p.ndim == 2:
+        # Apply Muon to weight matrices (2-D) and conv kernels (4-D)
+        # Everything else (biases, norms) gets plain Nesterov SGD
+        if p.ndim >= 2:
             matrix_params.append(p)
         else:
             scalar_params.append(p)
