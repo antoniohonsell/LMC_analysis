@@ -299,6 +299,8 @@ class TrainConfig:
     resnet_norm: str = "flax_ln"
     resnet_shortcut: str = "C"
     sgd_momentum: float = 0.9
+    muon_momentum: float = 0.95
+    muon_ns_steps: int = 5
     schedule: str = "none"  # none | cosine | warmup_cosine
     cosine_eta_min: float = 0.0
     warmup_epochs: int = 1
@@ -399,6 +401,23 @@ def _make_optimizer_and_scheduler(model: nn.Module, cfg: TrainConfig, steps_per_
             )
         elif cfg.schedule != "none":
             raise ValueError(f"Unsupported SGD schedule: {cfg.schedule}")
+        return optimizer, scheduler
+
+    if opt_name == "muon":
+        from muon import build_muon  # type: ignore
+        optimizer = build_muon(
+            model,
+            lr=float(cfg.lr),
+            momentum=float(cfg.muon_momentum),
+            ns_steps=int(cfg.muon_ns_steps),
+            weight_decay=float(cfg.weight_decay),
+        )
+        if cfg.schedule == "cosine":
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=int(cfg.epochs), eta_min=float(cfg.cosine_eta_min)
+            )
+        elif cfg.schedule != "none":
+            raise ValueError(f"Unsupported Muon schedule: {cfg.schedule}")
         return optimizer, scheduler
 
     raise ValueError(f"Unsupported optimizer: {cfg.optimizer_name}")
@@ -699,11 +718,23 @@ def default_hparam_grid(arch: str, optimizer_name: str, mode: str = "quick") -> 
             return {"lr": [1e-4, 3e-4, 1e-3], "wd": [1e-3, 5e-3, 1e-2]}
         return {"lr": [1e-4, 3e-4, 1e-3, 3e-3], "wd": [1e-4, 1e-3, 5e-3, 1e-2]}
 
+    if optimizer_name == "muon":
+        # Muon: lr is the main knob; weight_decay is typically 0
+        if arch == "mlp":
+            if mode == "quick":
+                return {"lr": [5e-3, 1e-2, 2e-2], "wd": [0.0]}
+            return {"lr": [2e-3, 5e-3, 1e-2, 2e-2, 5e-2], "wd": [0.0]}
+        if arch == "resnet20":
+            if mode == "quick":
+                return {"lr": [5e-3, 1e-2, 2e-2], "wd": [0.0]}
+            return {"lr": [2e-3, 5e-3, 1e-2, 2e-2, 5e-2], "wd": [0.0]}
+
     raise ValueError(f"No default grid for arch={arch}, optimizer={optimizer_name}")
 
 
 __all__ = [
     "TrainConfig",
+    "Muon",
     "TrialResult",
     "ExperimentSetup",
     "WarmupCosineConfig",
