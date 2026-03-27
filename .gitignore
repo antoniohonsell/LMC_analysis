@@ -44,7 +44,7 @@ activation_mlp_high_wd/
 CRH/controlled_exp/results*/
 wm_mlp_high_wd/
 fully_connected_example.ipynb
-
+muon_out/
 
 # need to handle better the git ignore !!!
 out/
