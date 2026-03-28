@@ -491,6 +491,7 @@ def train_run(
     device = utils.get_device()
     g_loader = torch.Generator().manual_seed(int(cfg.model_seed))
 
+    _persistent = int(cfg.num_workers) > 0
     train_loader = DataLoader(
         train_ds,
         batch_size=int(cfg.batch_size),
@@ -499,6 +500,7 @@ def train_run(
         worker_init_fn=seed_worker if int(cfg.num_workers) > 0 else None,
         generator=g_loader,
         pin_memory=(device.type == "cuda"),
+        persistent_workers=_persistent,
     )
     val_loader = DataLoader(
         val_ds,
@@ -506,6 +508,7 @@ def train_run(
         shuffle=False,
         num_workers=int(cfg.num_workers),
         pin_memory=(device.type == "cuda"),
+        persistent_workers=_persistent,
     )
 
     model = build_model(
