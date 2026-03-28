@@ -11,11 +11,13 @@ def validate(model, criterion, val_loader, device):
     val_loss_sum = 0.0
     correct = 0
 
+    _use_amp = device.type == "cuda"
     with torch.no_grad():
         for inputs, labels in val_loader:
             inputs, labels = inputs.to(device), labels.to(device)
-            outputs = model(inputs)
-            loss = criterion(outputs, labels)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=_use_amp):
+                outputs = model(inputs)
+                loss = criterion(outputs, labels)
 
             val_loss_sum += loss.item() * inputs.size(0)
             _, predicted = torch.max(outputs, 1)
@@ -108,23 +110,28 @@ def train(
 
         print(f"------------------------------\n Epoch: {epoch}")
 
+        _use_amp = device.type == "cuda"
         t1 = time.time()
+        correct = 0
         for inputs, labels in train_loader:
             inputs, labels = inputs.to(device), labels.to(device)
 
             optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = criterion(outputs, labels)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=_use_amp):
+                outputs = model(inputs)
+                loss = criterion(outputs, labels)
             loss.backward()
             optimizer.step()
             running_loss += loss.item() * inputs.size(0)
+            _, predicted = torch.max(outputs, 1)
+            correct += (predicted == labels).sum().item()
         t2 = time.time()
 
         if scheduler is not None:
                 scheduler.step()
 
         train_loss = running_loss / train_size
-        train_acc = get_train_accuracy(model, train_loader, device)
+        train_acc = correct / train_size
         val_loss, val_acc = validate(model, criterion, val_loader, device)
 
         # Save best checkpoint (by validation loss)
